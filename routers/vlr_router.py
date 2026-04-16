@@ -32,6 +32,29 @@ router = APIRouter(tags=["Default"])
 limiter = Limiter(key_func=get_remote_address)
 
 
+def _strip_match_team_ids(payload: dict) -> dict:
+    """Preserve the historical /match/details team shape for legacy clients."""
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return payload
+
+    segments = data.get("segments")
+    if not isinstance(segments, list):
+        return payload
+
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        teams = segment.get("teams")
+        if not isinstance(teams, list):
+            continue
+        for team in teams:
+            if isinstance(team, dict):
+                team.pop("id", None)
+
+    return payload
+
+
 @router.get("/news")
 @limiter.limit(RATE_LIMIT)
 async def VLR_news(request: Request):
@@ -154,7 +177,7 @@ async def VLR_match_detail(
 ):
     """Get detailed match data including per-map stats, rounds, and head-to-head."""
     validate_id_param(match_id, "match_id")
-    return await get_match_detail_data(match_id)
+    return _strip_match_team_ids(await get_match_detail_data(match_id))
 
 
 @router.get("/player")

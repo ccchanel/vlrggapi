@@ -26,6 +26,18 @@ PLAYER_ROW = """
 
 BASE_MATCH_HTML = f"""
 <html>
+  <a class="match-header-link wf-link-hover mod-1" href="/team/100/team-one">
+    <div class="match-header-link-name mod-1">
+      <div class="wf-title-med">Team One</div>
+      <div>ONE</div>
+    </div>
+  </a>
+  <a class="match-header-link wf-link-hover mod-2" href="/team/200/team-two">
+    <div class="match-header-link-name mod-2">
+      <div class="wf-title-med">Team Two</div>
+      <div>TWO</div>
+    </div>
+  </a>
   <div class="vm-stats-gamesnav-item" data-game-id="game-1"></div>
   <div class="vm-stats-gamesnav-item" data-game-id="game-2"></div>
 
@@ -113,6 +125,24 @@ async def test_vlr_match_detail_fetches_performance_and_economy_for_all_games(mo
     segment = data["data"]["segments"][0]
 
     assert data["data"]["status"] == 200
+    assert segment["teams"] == [
+        {
+            "id": "100",
+            "name": "Team One",
+            "tag": "ONE",
+            "logo": "",
+            "score": "",
+            "is_winner": False,
+        },
+        {
+            "id": "200",
+            "name": "Team Two",
+            "tag": "TWO",
+            "logo": "",
+            "score": "",
+            "is_winner": False,
+        },
+    ]
     assert segment["performance"]["kill_matrix"] == [{"player": "TenZ", "kills_vs": {"Opponent A": "5"}}]
     assert segment["performance"]["advanced_stats"] == [{"player": "TenZ", "2K": "3"}]
     assert segment["economy"] == [{"Team": "Team One", "Pistol": "50%"}]
@@ -143,4 +173,43 @@ async def test_vlr_match_detail_fetches_performance_and_economy_for_all_games(mo
     }
     assert segment["maps"][1]["economy"] == [{"Team": "Team Two", "Pistol": "50%"}]
     assert len(client.calls) == 5
+    cache_manager.clear_all()
+
+
+@pytest.mark.anyio
+async def test_vlr_match_detail_uses_empty_team_id_when_header_link_is_missing(monkeypatch):
+    cache_manager.clear_all()
+    client = FakeAsyncClient(
+        {
+            "https://www.vlr.gg/777": [
+                FakeResponse(
+                    200,
+                    BASE_MATCH_HTML.replace(
+                        '<a class="match-header-link wf-link-hover mod-2" href="/team/200/team-two">\n'
+                        '    <div class="match-header-link-name mod-2">\n'
+                        '      <div class="wf-title-med">Team Two</div>\n'
+                        '      <div>TWO</div>\n'
+                        '    </div>\n'
+                        '  </a>\n',
+                        '<div class="match-header-link-name mod-2">\n'
+                        '  <div class="wf-title-med">Team Two</div>\n'
+                        '  <div>TWO</div>\n'
+                        '</div>\n',
+                    ),
+                )
+            ],
+            "https://www.vlr.gg/777/?game=game-1&tab=performance": [FakeResponse(200, performance_html("Opponent A"))],
+            "https://www.vlr.gg/777/?game=game-1&tab=economy": [FakeResponse(200, economy_html("Team One"))],
+            "https://www.vlr.gg/777/?game=game-2&tab=performance": [FakeResponse(200, performance_html("Opponent B"))],
+            "https://www.vlr.gg/777/?game=game-2&tab=economy": [FakeResponse(200, economy_html("Team Two"))],
+        }
+    )
+
+    monkeypatch.setattr("api.scrapers.match_detail.get_http_client", lambda: client)
+
+    data = await vlr_match_detail("777")
+    teams = data["data"]["segments"][0]["teams"]
+
+    assert teams[0]["id"] == "100"
+    assert teams[1]["id"] == ""
     cache_manager.clear_all()

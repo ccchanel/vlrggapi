@@ -267,6 +267,8 @@ Fetches detailed data for a specific match.
 
 - **Params:**
   - `match_id` (required) — VLR.GG match ID
+- **Response notes:**
+  - `teams[].id` — VLR.GG team ID, usable with `GET /v2/team?id=...`
 - **Cache:** 5 minutes (30s for live matches)
 
 ```
@@ -279,8 +281,8 @@ GET /v2/match/details?match_id=595657
   "data": {
     "event": { "name": "Champions Tour 2024: Americas Stage 1", "series": "Regular Season: Week 3" },
     "teams": [
-      { "name": "Sentinels", "score": 2, "logo": "//owcdn.net/img/..." },
-      { "name": "Cloud9", "score": 1, "logo": "//owcdn.net/img/..." }
+      { "id": "2", "name": "Sentinels", "score": 2, "logo": "//owcdn.net/img/..." },
+      { "id": "188", "name": "Cloud9", "score": 1, "logo": "//owcdn.net/img/..." }
     ],
     "maps": [
       {
