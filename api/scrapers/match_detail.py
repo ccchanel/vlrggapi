@@ -95,6 +95,12 @@ def _parse_teams(html: HTMLParser) -> list[dict]:
     teams: list[dict] = []
 
     for mod in ("mod-1", "mod-2"):
+        team_id = ""
+        link_elem = html.css_first(f".match-header-link.{mod}")
+        if link_elem:
+            href = link_elem.attributes.get("href", "")
+            team_id, _ = parse_href_id_slug(href)
+
         name_elem = html.css_first(f".match-header-link-name.{mod}")
         name = ""
         tag = ""
@@ -107,7 +113,16 @@ def _parse_teams(html: HTMLParser) -> list[dict]:
             if len(lines) > 1:
                 tag = lines[1]
 
-        teams.append({"name": name, "tag": tag, "logo": "", "score": "", "is_winner": False})
+        teams.append(
+            {
+                "id": team_id,
+                "name": name,
+                "tag": tag,
+                "logo": "",
+                "score": "",
+                "is_winner": False,
+            }
+        )
 
     # Logos: two <img> elements inside .match-header-vs
     vs_elem = html.css_first(".match-header-vs")

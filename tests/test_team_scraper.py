@@ -2,7 +2,12 @@ import pytest
 
 from fastapi import HTTPException
 
-from api.scrapers.teams import vlr_team, vlr_team_matches, vlr_team_transactions
+from api.scrapers.teams import (
+    _extract_prize_from_text,
+    vlr_team,
+    vlr_team_matches,
+    vlr_team_transactions,
+)
 
 
 class FakeResponse:
@@ -19,6 +24,21 @@ class FakeAsyncClient:
     async def get(self, url: str, timeout=None):
         self.calls.append((url, timeout))
         return self.response
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("1st $50,0002024", "$50,000"),
+        ("2nd $2,024", "$2,024"),
+        ("special prize $2024", "$2024"),
+        ("winner $100K 2024", "$100K"),
+        ("no prize here", ""),
+        ("", ""),
+    ],
+)
+def test_extract_prize_from_text_handles_concatenated_years(text, expected):
+    assert _extract_prize_from_text(text) == expected
 
 
 @pytest.mark.anyio
