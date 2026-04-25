@@ -12,9 +12,7 @@ updates:
       prefix: "chore(deps)"
       include: "scope"
     cooldown:
-      semver-major-days: 30
-      semver-minor-days: 14
-      semver-patch-days: 7
+      default-days: 7
     groups:
       github-actions-routine:
         patterns:
