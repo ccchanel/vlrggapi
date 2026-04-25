@@ -360,11 +360,17 @@ def _extract_placement(text: str) -> str:
 
 
 def _extract_prize_from_text(text: str) -> str:
-    """Pull a dollar-amount string from free text."""
+    """Pull a dollar-amount string from free text, excluding trailing years."""
     if not text:
         return ""
     match = re.search(r"\$([\d,]+(?:\.\d+)?(?:[KMkm])?)", text)
-    return match.group(0) if match else ""
+    if not match:
+        return ""
+    
+    prize = match.group(0)
+    # Remove years that got concatenated at the end (e.g., "2020", "2023", etc.)
+    prize = re.sub(r"(20\d{2}|19\d{2})$", "", prize)
+    return prize
 
 
 def _extract_date_from_text(text: str) -> str:
