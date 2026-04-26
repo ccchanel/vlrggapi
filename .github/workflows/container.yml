@@ -12,6 +12,10 @@ on:
         required: false
         type: string
         default: ""
+    secrets:
+      GHCR_PAT:
+        description: Optional PAT with write:packages for GHCR publishing.
+        required: false
 
 permissions:
   contents: read
@@ -42,7 +46,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ github.token }}
+          password: ${{ secrets.GHCR_PAT || github.token }}
 
       - name: Set image metadata
         id: vars

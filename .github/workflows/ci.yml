@@ -65,3 +65,5 @@ jobs:
       image-tags: |
         type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
         type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
+    secrets:
+      GHCR_PAT: ${{ secrets.GHCR_PAT }}
