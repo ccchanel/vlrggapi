@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, master]
+  pull_request:
+    branches: [dev, master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Test Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: requirements.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv pip install --system -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+  docker-smoke:
+    name: Docker smoke build
+    needs: test
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/container.yml
+    with:
+      push: false
+
+  publish:
+    name: Publish Docker image
+    needs: test
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/dev' ||
+       github.ref == 'refs/heads/master')
+    uses: ./.github/workflows/container.yml
+    with:
+      push: true
+      image-tags: |
+        type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+        type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
+    secrets:
+      GHCR_PAT: ${{ secrets.GHCR_PAT }}
