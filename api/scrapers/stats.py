@@ -23,6 +23,14 @@ LA_COMBINED = {"la"}
 # Concurrent requests — high enough to be fast, low enough to avoid rate-limiting
 _SEMAPHORE_LIMIT = 20
 
+# Keywords that identify Game Changers events (case-insensitive)
+_GC_KEYWORDS = {"game changers", "game_changers", "gc"}
+
+
+def _is_gc_event(name: str) -> bool:
+    name_lower = name.lower()
+    return any(kw in name_lower for kw in _GC_KEYWORDS)
+
 
 def _cell_text(cells: list, index: int) -> str:
     if index >= len(cells):
@@ -75,19 +83,31 @@ def _parse_stats_row(item) -> dict:
     }
 
 
-async def _discover_all_event_group_ids(client) -> list:
-    """Fetch all event_group_id values from the VLR.gg stats dropdown."""
+async def _discover_event_group_ids(client) -> tuple[list, list]:
+    """
+    Fetch the VLR.gg stats dropdown and return two lists:
+      - open_ids:  event_group_ids for non-GC events
+      - gc_ids:    event_group_ids for Game Changers events
+    """
     resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
     html = HTMLParser(resp.text)
     select = html.css_first("select[name='event_group_id']")
-    ids = []
+    open_ids, gc_ids = [], []
     if select:
         for option in select.css("option"):
             val = option.attributes.get("value", "all")
-            if val != "all":
-                ids.append(val)
-    logger.info("Discovered %d total event group IDs", len(ids))
-    return ids
+            if val == "all":
+                continue
+            name = (option.text() or "").strip()
+            if _is_gc_event(name):
+                gc_ids.append(val)
+            else:
+                open_ids.append(val)
+    logger.info(
+        "Discovered %d open event IDs and %d GC event IDs",
+        len(open_ids), len(gc_ids)
+    )
+    return open_ids, gc_ids
 
 
 def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
@@ -129,9 +149,9 @@ def _merge(primary: list, secondary: list) -> list:
     return primary + extras
 
 
-async def _fetch_all_for_region(region: str, timespan: str, all_ids: list, client) -> list:
+async def _fetch_all_for_region(region: str, timespan: str, ids: list, client) -> list:
     semaphore = asyncio.Semaphore(_SEMAPHORE_LIMIT)
-    urls = [_stats_url(eid, region, timespan) for eid in all_ids]
+    urls = [_stats_url(eid, region, timespan) for eid in ids]
     results = await asyncio.gather(*[_fetch_rows(u, client, semaphore) for u in urls])
     merged = []
     for rows in results:
@@ -146,21 +166,24 @@ async def vlr_stats(region_key: str, timespan: str):
         validate_timespan(timespan)
 
         client = get_http_client()
-        all_ids = await _discover_all_event_group_ids(client)
+        open_ids, gc_ids = await _discover_event_group_ids(client)
 
         if region_key == "gc":
-            rows = await _fetch_all_for_region("gc", timespan, all_ids, client)
+            # GC region: only scrape GC-tagged event groups
+            rows = await _fetch_all_for_region("gc", timespan, gc_ids, client)
 
         elif region_key in LA_COMBINED:
+            # "la" = las + lan, non-GC events only
             las_rows, lan_rows = await asyncio.gather(
-                _fetch_all_for_region("las", timespan, all_ids, client),
-                _fetch_all_for_region("lan", timespan, all_ids, client),
+                _fetch_all_for_region("las", timespan, open_ids, client),
+                _fetch_all_for_region("lan", timespan, open_ids, client),
             )
             rows = _merge(las_rows, lan_rows)
 
         else:
             vlr_region = VLR_REGION_MAP.get(region_key, region_key)
-            rows = await _fetch_all_for_region(vlr_region, timespan, all_ids, client)
+            # Non-GC regions: only scrape non-GC event groups
+            rows = await _fetch_all_for_region(vlr_region, timespan, open_ids, client)
 
         logger.info("vlr_stats(%s, %s): %d players", region_key, timespan, len(rows))
         return {"data": {"status": 200, "segments": rows}}
