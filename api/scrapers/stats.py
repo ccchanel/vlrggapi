@@ -89,7 +89,7 @@ async def vlr_stats(region_key: str, timespan: str):
             gc_eid = await _find_gc_event_group_id(client)
             base_url = (
                 f"{VLR_STATS_URL}/?event_group_id={gc_eid}&event_id=all"
-                f"&region=all&country=all&min_rounds=200"
+                f"&region=all&country=all&min_rounds=50"
                 f"&min_rating=1550&agent=all&map_id=all"
             )
         else:
