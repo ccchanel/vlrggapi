@@ -82,27 +82,12 @@ def _parse_stats_row(item) -> dict:
     if not org:
         org = "N/A"
 
-    # Try to recover the full team name from any team-logo img alt/title or
-    # team-link slug, falling back to the abbreviation.
+    # NOTE: VLR.gg's stats page only exposes the team tag (e.g. "SEN"),
+    # not the full team name. The full name is available via the player
+    # profile endpoint (see vlr_player), so we leave team_full empty here
+    # and let the frontend resolve current team via player profile when
+    # it opens the detail panel.
     team_full = ""
-    if player_cell:
-        for img in player_cell.css("img"):
-            alt = (img.attributes.get("alt") or "").strip()
-            title = (img.attributes.get("title") or "").strip()
-            candidate = alt or title
-            if candidate and candidate.lower() not in {"player", "country", "flag"}:
-                team_full = candidate
-                break
-        if not team_full:
-            tlink = player_cell.css_first("a[href*='/team/']")
-            if tlink:
-                href = tlink.attributes.get("href", "")
-                parts = [p for p in href.strip("/").split("/") if p]
-                # /team/<id>/<slug>
-                if len(parts) >= 3 and parts[0] == "team":
-                    slug = parts[2].replace("-", " ").strip()
-                    if slug:
-                        team_full = slug.title()
 
     player_id = ""
     if player_cell:
