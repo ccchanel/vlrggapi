@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 from selectolax.parser import HTMLParser
 
@@ -11,6 +12,9 @@ from utils.html_parsers import extract_text_content
 
 # ── Background job tracking ───────────────────────────────────────────────────
 _building: set[str] = set()
+_failed_builds: dict[str, float] = {}  # job_key → unix timestamp of last failure
+_FAILURE_BACKOFF = 60  # seconds before we retry after a failed build
+_BUILD_HARD_TIMEOUT = 90  # seconds — kill a build that runs longer than this
 
 def _job_key(region_key: str, timespan: str) -> str:
     return f"stats:{region_key}:{timespan}"
@@ -23,13 +27,35 @@ def is_building(region_key: str, timespan: str) -> bool:
     """Return True if a background scrape is in progress."""
     return _job_key(region_key, timespan) in _building
 
+def recently_failed(region_key: str, timespan: str) -> bool:
+    """Return True if a recent build failed (within backoff window)."""
+    key = _job_key(region_key, timespan)
+    ts = _failed_builds.get(key)
+    return bool(ts and (time.time() - ts) < _FAILURE_BACKOFF)
+
 async def _background_build(region_key: str, timespan: str):
     key = _job_key(region_key, timespan)
     try:
-        await vlr_stats(region_key, timespan)
-        logger.info("Background stats build complete: %s", key)
+        # Hard timeout so a single bad scrape can't hang for minutes
+        result = await asyncio.wait_for(
+            vlr_stats(region_key, timespan),
+            timeout=_BUILD_HARD_TIMEOUT,
+        )
+        # If the scrape succeeded but returned 0 players, treat as failure
+        # so the polling client doesn't loop forever on empty data.
+        segments = (result or {}).get("data", {}).get("segments", [])
+        if not segments:
+            logger.warning("Background stats build returned 0 players: %s", key)
+            _failed_builds[key] = time.time()
+        else:
+            _failed_builds.pop(key, None)
+            logger.info("Background stats build complete: %s (%d players)", key, len(segments))
+    except asyncio.TimeoutError:
+        logger.error("Background stats build TIMED OUT after %ds: %s", _BUILD_HARD_TIMEOUT, key)
+        _failed_builds[key] = time.time()
     except Exception as exc:
         logger.error("Background stats build failed for %s: %s", key, exc)
+        _failed_builds[key] = time.time()
     finally:
         _building.discard(key)
 
@@ -58,13 +84,23 @@ LA_COMBINED = {"la"}
 # Concurrent requests — high enough to be fast, low enough to avoid rate-limiting
 _SEMAPHORE_LIMIT = 20
 
-# Keywords that identify Game Changers events (case-insensitive)
-_GC_KEYWORDS = {"game changers", "game_changers", "gc"}
+# Keywords that identify Game Changers events (case-insensitive). We strip
+# whitespace/punctuation before checking so 'game-changers' or 'GameChangers'
+# also match.
+_GC_KEYWORDS = ("gamechangers", "vctgc", " gc ", " gc:")
 
 
 def _is_gc_event(name: str) -> bool:
-    name_lower = name.lower()
-    return any(kw in name_lower for kw in _GC_KEYWORDS)
+    if not name:
+        return False
+    raw = name.lower().strip()
+    # Pad with spaces so word-boundary keywords (' gc ') can match start/end
+    padded = f" {raw} "
+    if any(kw in padded for kw in _GC_KEYWORDS):
+        return True
+    # Also catch the canonical full form regardless of separators
+    flat = "".join(ch for ch in raw if ch.isalnum())
+    return "gamechangers" in flat
 
 
 def _cell_text(cells: list, index: int) -> str:
@@ -132,7 +168,11 @@ async def _discover_event_group_ids(client) -> tuple[list, list]:
       - open_ids:  event_group_ids for non-GC events
       - gc_ids:    event_group_ids for Game Changers events
     """
-    resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
+    # Tight timeout — if the dropdown is slow we want to fail fast,
+    # not eat 90 seconds before the actual scrape can start.
+    resp = await fetch_with_retries(
+        f"{VLR_STATS_URL}/", client=client, timeout=10, max_retries=1
+    )
     html = HTMLParser(resp.text)
     select = html.css_first("select[name='event_group_id']")
     open_ids, gc_ids = [], []

@@ -22,7 +22,7 @@ from routers.shared_handlers import (
     get_team_matches_data,
     get_team_transactions_data,
 )
-from api.scrapers.stats import get_cached_stats, is_building, start_background_build
+from api.scrapers.stats import get_cached_stats, is_building, recently_failed, start_background_build
 from utils.constants import RATE_LIMIT, MAX_MATCH_QUERY_BOUND
 from utils.error_handling import (
     validate_event_query,
@@ -88,6 +88,17 @@ async def v2_stats(
         cached = get_cached_stats(region, timespan)
         if cached is not None:
             return _wrap_v2(cached)
+
+    # Recent build failed → return error so client stops polling
+    if recently_failed(region, timespan):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"The last scrape for region '{region}' failed or returned "
+                f"no players. Try a different timespan, or wait a minute "
+                f"and click refresh."
+            ),
+        )
 
     # Already building → tell client to poll
     if is_building(region, timespan):
