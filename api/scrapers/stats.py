@@ -67,14 +67,22 @@ def _parse_stats_row(item) -> dict:
 @handle_scraper_errors
 async def vlr_stats(region_key: str, timespan: str):
     async def build():
-        region_name = validate_region(region_key)
+        validate_region(region_key)
         validate_timespan(timespan)
 
-        base_url = (
-            f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
-            f"&region={region_name}&country=all&min_rounds=200"
-            f"&min_rating=1550&agent=all&map_id=all"
-        )
+        # GC stats live under the game-changers series filter, not a standard region
+        if region_key == "gc":
+            base_url = (
+                f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
+                f"&series_id=game-changers&region=all&country=all&min_rounds=200"
+                f"&min_rating=1550&agent=all&map_id=all"
+            )
+        else:
+            base_url = (
+                f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
+                f"&region={region_key}&country=all&min_rounds=200"
+                f"&min_rating=1550&agent=all&map_id=all"
+            )
         url = (
             f"{base_url}&timespan=all"
             if timespan.lower() == "all"
