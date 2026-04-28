@@ -3,22 +3,17 @@ import logging
 from selectolax.parser import HTMLParser
 
 from utils.http_client import fetch_with_retries, get_http_client
-from utils.constants import VLR_BASE_URL, VLR_STATS_URL, CACHE_TTL_STATS
+from utils.constants import VLR_STATS_URL, CACHE_TTL_STATS
 from utils.cache_manager import cache_manager
 from utils.error_handling import handle_scraper_errors, validate_region, validate_timespan
 from utils.html_parsers import extract_text_content
 
 logger = logging.getLogger(__name__)
 
-# VCT restructured into circuits — these regions no longer filter cleanly via the
-# ?region= param alone. We discover their event_group_id from the stats page dropdown
-# so we get the right circuit data (same technique as GC).
-CIRCUIT_KEYWORDS = {
-    "eu": ["emea"],
-    "na": ["americas"],
-    "ap": ["pacific"],
-    "gc": ["game changer"],
-}
+# Regions that are part of the global VCT circuit (Americas/EMEA/Pacific).
+# These need event_group_id filtering to work — using region= alone with
+# event_group_id=all returns all players globally.
+VCT_REGIONS = {"na", "eu", "ap"}
 
 
 def _cell_text(cells: list, index: int) -> str:
@@ -74,20 +69,36 @@ def _parse_stats_row(item) -> dict:
     }
 
 
-async def _find_event_group_id(client, keywords: list[str]) -> str:
-    """Fetch the VLR.gg stats page and find an event_group_id matching any keyword."""
+async def _discover_event_groups(client) -> dict:
+    """
+    Parse the VLR.gg stats page dropdown once to find the latest event_group_id
+    for the main VCT circuit and for Game Changers.
+    Options are listed newest-first so first match = current season.
+    """
     resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
     html = HTMLParser(resp.text)
     select = html.css_first("select[name='event_group_id']")
+    groups = {"vct": "all", "gc": "all"}
     if select:
         for option in select.css("option"):
             text = (option.text() or "").strip().lower()
-            if any(kw in text for kw in keywords):
-                val = option.attributes.get("value", "all")
-                logger.info("Matched event_group_id=%s for keywords=%s (text=%r)", val, keywords, text)
-                return val
-    logger.warning("No event_group_id match for keywords=%s, falling back to 'all'", keywords)
-    return "all"
+            val = option.attributes.get("value", "all")
+            if val == "all":
+                continue
+            if "game changer" in text and groups["gc"] == "all":
+                groups["gc"] = val
+                logger.info("Found GC event_group_id=%s (%s)", val, text)
+            elif (
+                "valorant champions tour" in text
+                and "game changer" not in text
+                and "off//season" not in text
+                and groups["vct"] == "all"
+            ):
+                groups["vct"] = val
+                logger.info("Found VCT event_group_id=%s (%s)", val, text)
+            if groups["vct"] != "all" and groups["gc"] != "all":
+                break  # found both, stop scanning
+    return groups
 
 
 @handle_scraper_errors
@@ -98,20 +109,31 @@ async def vlr_stats(region_key: str, timespan: str):
 
         client = get_http_client()
 
-        if region_key in CIRCUIT_KEYWORDS:
-            # VCT circuits and GC: discover event_group_id from the stats page dropdown.
-            # Using event_group_id gives clean per-circuit results; region=all ensures we
-            # don't accidentally double-filter and miss players.
-            eid = await _find_event_group_id(client, CIRCUIT_KEYWORDS[region_key])
-            min_rounds = 50 if region_key == "gc" else 100
-            base_url = (
-                f"{VLR_STATS_URL}/?event_group_id={eid}&event_id=all"
-                f"&region=all&country=all&min_rounds={min_rounds}"
-                f"&min_rating=1550&agent=all&map_id=all"
-            )
+        if region_key == "gc" or region_key in VCT_REGIONS:
+            # GC and main VCT circuits (NA/EU/AP) all need a specific event_group_id
+            # for VLR.gg to apply server-side filtering. With event_group_id=all the
+            # region param is silently ignored and all players are returned.
+            groups = await _discover_event_groups(client)
+
+            if region_key == "gc":
+                eid = groups["gc"]
+                # GC players span all regions — use region=gc (valid dropdown value)
+                base_url = (
+                    f"{VLR_STATS_URL}/?event_group_id={eid}&event_id=all"
+                    f"&region=gc&country=all&min_rounds=50"
+                    f"&min_rating=1550&agent=all&map_id=all"
+                )
+            else:
+                eid = groups["vct"]
+                # VCT regions: pair the VCT event group with the specific region tag
+                base_url = (
+                    f"{VLR_STATS_URL}/?event_group_id={eid}&event_id=all"
+                    f"&region={region_key}&country=all&min_rounds=100"
+                    f"&min_rating=1550&agent=all&map_id=all"
+                )
         else:
             # Smaller / regional circuits (kr, jp, br, la, oce, mn, col, etc.)
-            # still use the region parameter which works for these.
+            # These still filter correctly via the region param alone.
             base_url = (
                 f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
                 f"&region={region_key}&country=all&min_rounds=200"
@@ -123,6 +145,7 @@ async def vlr_stats(region_key: str, timespan: str):
             if timespan.lower() == "all"
             else f"{base_url}&timespan={timespan}d"
         )
+
         resp = await fetch_with_retries(url, client=client)
         html = HTMLParser(resp.text)
         status = resp.status_code
