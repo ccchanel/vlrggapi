@@ -93,6 +93,7 @@ async def _discover_event_groups(client) -> dict:
                 "valorant champions tour" in text
                 and "game changer" not in text
                 and "off//season" not in text
+                and "partner series" not in text
                 and groups["vct"] == "all"
             ):
                 groups["vct"] = val
@@ -149,7 +150,7 @@ async def vlr_stats(region_key: str, timespan: str):
             )
             chal_url = (
                 f"{VLR_STATS_URL}/?event_group_id={groups['challengers']}&event_id=all"
-                f"&region={region_key}&country=all&min_rounds=20"
+                f"&region={region_key}&country=all&min_rounds=0"
                 f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
             )
             vct_rows, chal_rows = await asyncio.gather(
