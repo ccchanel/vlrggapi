@@ -11,23 +11,18 @@ from utils.html_parsers import extract_text_content
 
 logger = logging.getLogger(__name__)
 
-# All these regions need a specific event_group_id paired with their region code —
-# event_group_id=all silently returns global data regardless of region= value.
-VCT_REGIONS = {"na", "eu", "ap"}
-
-# These regions also need event_group_id filtering but don't have a VCT top-league
-# entry — Challengers alone is sufficient.
-CHAL_ONLY_REGIONS = {"la-s", "la-n", "br", "kr", "jp", "oce", "mn", "cn", "col"}
-
-# VLR.gg stats URL region codes differ from our API keys for some regions
+# Regions that map to different VLR.gg region codes
 VLR_REGION_MAP = {
     "la-s": "las",
     "la-n": "lan",
-    "col": "cg",
+    "col":  "cg",
 }
 
-# "la" isn't a VLR.gg region — we split it into las + lan
+# "la" splits into las + lan
 LA_COMBINED = {"la"}
+
+# Max concurrent requests to VLR.gg to avoid rate-limiting
+_SEMAPHORE_LIMIT = 8
 
 
 def _cell_text(cells: list, index: int) -> str:
@@ -81,60 +76,46 @@ def _parse_stats_row(item) -> dict:
     }
 
 
-async def _discover_event_groups(client) -> dict:
+async def _discover_all_event_group_ids(client) -> list:
     """
-    Parse the VLR.gg stats page dropdown to find current event_group_ids.
-    Options are listed newest-first so first match = current season.
+    Fetch the VLR.gg stats page and return every event_group_id
+    available in the dropdown (newest first, excludes 'all').
     """
     resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
     html = HTMLParser(resp.text)
     select = html.css_first("select[name='event_group_id']")
-    groups = {"vct": "all", "challengers": "all", "gc": "all"}
+    ids = []
     if select:
         for option in select.css("option"):
-            text = (option.text() or "").strip().lower()
             val = option.attributes.get("value", "all")
-            if val == "all":
-                continue
-            if "game changer" in text and groups["gc"] == "all":
-                groups["gc"] = val
-            elif "challengers league" in text and groups["challengers"] == "all":
-                groups["challengers"] = val
-            elif (
-                "valorant champions tour" in text
-                and "game changer" not in text
-                and "off//season" not in text
-                and "partner series" not in text
-                and groups["vct"] == "all"
-            ):
-                groups["vct"] = val
-            if all(v != "all" for v in groups.values()):
-                break
-    logger.info("Discovered event groups: %s", groups)
-    return groups
+            if val != "all":
+                ids.append(val)
+    logger.info("Discovered %d event group IDs", len(ids))
+    return ids
 
 
-async def _fetch_rows(url: str, client) -> list:
-    try:
-        resp = await fetch_with_retries(url, client=client)
-        if resp.status_code != 200:
+async def _fetch_rows(url: str, client, semaphore: asyncio.Semaphore) -> list:
+    async with semaphore:
+        try:
+            resp = await fetch_with_retries(url, client=client)
+            if resp.status_code != 200:
+                return []
+            html = HTMLParser(resp.text)
+            rows = []
+            for item in html.css("tbody tr"):
+                parsed = _parse_stats_row(item)
+                if parsed["player"]:
+                    rows.append(parsed)
+            return rows
+        except Exception as exc:
+            logger.warning("Failed to fetch %s: %s", url, exc)
             return []
-        html = HTMLParser(resp.text)
-        rows = []
-        for item in html.css("tbody tr"):
-            parsed = _parse_stats_row(item)
-            if parsed["player"]:
-                rows.append(parsed)
-        return rows
-    except Exception as exc:
-        logger.warning("Failed to fetch %s: %s", url, exc)
-        return []
 
 
 def _merge(primary: list, secondary: list) -> list:
     """Merge two player lists, deduplicating by player_id then name."""
-    seen_ids = {r["player_id"] for r in primary if r["player_id"]}
-    seen_names = {r["player"] for r in primary}
+    seen_ids   = {r["player_id"] for r in primary if r["player_id"]}
+    seen_names = {r["player"]    for r in primary}
     extras = [
         r for r in secondary
         if (r["player_id"] and r["player_id"] not in seen_ids)
@@ -143,12 +124,27 @@ def _merge(primary: list, secondary: list) -> list:
     return primary + extras
 
 
-def _chal_url(eid: str, region: str, ts: str) -> str:
+def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
     return (
-        f"{VLR_STATS_URL}/?event_group_id={eid}&event_id=all"
+        f"{VLR_STATS_URL}/?event_group_id={event_group_id}&event_id=all"
         f"&region={region}&country=all&min_rounds=0"
-        f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
+        f"&min_rating=1550&agent=all&map_id=all&timespan={timespan}"
     )
+
+
+async def _fetch_all_for_region(region: str, timespan: str, all_ids: list, client) -> list:
+    """
+    Fetch stats from every event group for a single region and merge.
+    Uses a semaphore to avoid hammering VLR.gg.
+    """
+    semaphore = asyncio.Semaphore(_SEMAPHORE_LIMIT)
+    urls = [_stats_url(eid, region, timespan) for eid in all_ids]
+    results = await asyncio.gather(*[_fetch_rows(u, client, semaphore) for u in urls])
+
+    merged = []
+    for rows in results:
+        merged = _merge(merged, rows)
+    return merged
 
 
 @handle_scraper_errors
@@ -159,43 +155,27 @@ async def vlr_stats(region_key: str, timespan: str):
 
         client = get_http_client()
         ts = "all" if timespan.lower() == "all" else f"{timespan}d"
-        groups = await _discover_event_groups(client)
+
+        # Get every event group ID from the dropdown
+        all_ids = await _discover_all_event_group_ids(client)
 
         if region_key == "gc":
-            rows = await _fetch_rows(_chal_url(groups["gc"], "gc", ts), client)
-
-        elif region_key in VCT_REGIONS:
-            # VCT top league + Challengers in parallel for full coverage
-            vct_url = _chal_url(groups["vct"], region_key, ts)
-            chal_url = _chal_url(groups["challengers"], region_key, ts)
-            vct_rows, chal_rows = await asyncio.gather(
-                _fetch_rows(vct_url, client),
-                _fetch_rows(chal_url, client),
-            )
-            rows = _merge(vct_rows, chal_rows)
-
-        elif region_key in CHAL_ONLY_REGIONS:
-            # Challengers covers these regions — event_group_id=all doesn't filter properly
-            vlr_region = VLR_REGION_MAP.get(region_key, region_key)
-            rows = await _fetch_rows(_chal_url(groups["challengers"], vlr_region, ts), client)
+            # Game Changers: use region=gc across all event groups
+            rows = await _fetch_all_for_region("gc", ts, all_ids, client)
 
         elif region_key in LA_COMBINED:
-            # "la" = las + lan combined
+            # "la" = las + lan combined across all event groups
             las_rows, lan_rows = await asyncio.gather(
-                _fetch_rows(_chal_url(groups["challengers"], "las", ts), client),
-                _fetch_rows(_chal_url(groups["challengers"], "lan", ts), client),
+                _fetch_all_for_region("las", ts, all_ids, client),
+                _fetch_all_for_region("lan", ts, all_ids, client),
             )
             rows = _merge(las_rows, lan_rows)
 
         else:
             vlr_region = VLR_REGION_MAP.get(region_key, region_key)
-            rows = await _fetch_rows(
-                f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
-                f"&region={vlr_region}&country=all&min_rounds=0"
-                f"&min_rating=1550&agent=all&map_id=all&timespan={ts}",
-                client,
-            )
+            rows = await _fetch_all_for_region(vlr_region, ts, all_ids, client)
 
+        logger.info("vlr_stats(%s, %s): %d players", region_key, timespan, len(rows))
         return {"data": {"status": 200, "segments": rows}}
 
     return await cache_manager.get_or_create_async(
