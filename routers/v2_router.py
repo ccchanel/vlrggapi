@@ -249,3 +249,47 @@ async def v2_health():
     result = await get_health_data()
     return {"status": "success", "data": result}
 
+
+@router.get("/debug/stats-test")
+async def v2_debug_stats_test():
+    """Test multiple event_group_id + region combos to find what returns EU data."""
+    from selectolax.parser import HTMLParser
+    from utils.http_client import fetch_with_retries, get_http_client
+    from utils.constants import VLR_STATS_URL
+    client = get_http_client()
+    combos = [
+        ("all", "eu", "0"),
+        ("all", "eu", "50"),
+        ("all", "eu", "200"),
+        ("86", "eu", "0"),
+        ("86", "eu", "20"),
+        ("86", "all", "0"),
+        ("85", "eu", "0"),
+        ("85", "all", "0"),
+        ("89", "eu", "0"),
+        ("89", "all", "0"),
+        ("74", "eu", "0"),
+        ("74", "eu", "100"),
+        ("74", "eu", "200"),
+    ]
+    results = []
+    for eid, region, min_rounds in combos:
+        url = (f"{VLR_STATS_URL}/?event_group_id={eid}&event_id=all"
+               f"&region={region}&country=all&min_rounds={min_rounds}"
+               f"&min_rating=1550&agent=all&map_id=all&timespan=all")
+        resp = await fetch_with_retries(url, client=client)
+        html = HTMLParser(resp.text)
+        rows = [r for r in html.css("tbody tr") if r.css_first("td.mod-player")]
+        first3 = []
+        for row in rows[:3]:
+            pc = row.css_first("td.mod-player")
+            name = (pc.css_first(".text-of").text() if pc and pc.css_first(".text-of") else "?").strip()
+            org_el = pc.css_first(".stats-player-country") if pc else None
+            org = (org_el.text() if org_el else "?").strip()
+            first3.append(f"{name}/{org}")
+        results.append({
+            "event_group_id": eid, "region": region, "min_rounds": min_rounds,
+            "count": len(rows), "sample": first3
+        })
+    return {"status": "success", "data": results}
+
