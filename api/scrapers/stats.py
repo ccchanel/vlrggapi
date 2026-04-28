@@ -64,16 +64,31 @@ def _parse_stats_row(item) -> dict:
     }
 
 
+async def _find_gc_event_group_id(client) -> str:
+    """Fetch the VLR.gg stats page and parse the event_group_id for Game Changers."""
+    resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
+    html = HTMLParser(resp.text)
+    select = html.css_first("select[name='event_group_id']")
+    if select:
+        for option in select.css("option"):
+            text = (option.text() or "").strip().lower()
+            if "game changer" in text:
+                return option.attributes.get("value", "all")
+    return "all"
+
+
 @handle_scraper_errors
 async def vlr_stats(region_key: str, timespan: str):
     async def build():
         validate_region(region_key)
         validate_timespan(timespan)
 
-        # GC has its own stats section at /game-changers/stats/, not the main stats page
+        client = get_http_client()
+
         if region_key == "gc":
+            gc_eid = await _find_gc_event_group_id(client)
             base_url = (
-                f"{VLR_BASE_URL}/game-changers/stats/?event_group_id=all&event_id=all"
+                f"{VLR_STATS_URL}/?event_group_id={gc_eid}&event_id=all"
                 f"&region=all&country=all&min_rounds=200"
                 f"&min_rating=1550&agent=all&map_id=all"
             )
@@ -88,8 +103,6 @@ async def vlr_stats(region_key: str, timespan: str):
             if timespan.lower() == "all"
             else f"{base_url}&timespan={timespan}d"
         )
-
-        client = get_http_client()
         resp = await fetch_with_retries(url, client=client)
         html = HTMLParser(resp.text)
         status = resp.status_code
