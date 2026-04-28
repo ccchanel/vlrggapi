@@ -67,6 +67,7 @@ async def v2_stats(
     request: Request,
     region: str = Query(..., description="Region shortname (na, eu, ap, la, etc.)"),
     timespan: str = Query(..., description="Timespan: 30, 60, 90, or all"),
+    force: bool = Query(False, description="Force a fresh scrape, ignoring cache"),
 ):
     """
     Get player statistics for a region and timespan.
@@ -77,10 +78,16 @@ async def v2_stats(
     validate_region(region)
     validate_timespan(timespan)
 
-    # Cache hit → immediate response
-    cached = get_cached_stats(region, timespan)
-    if cached is not None:
-        return _wrap_v2(cached)
+    # Force refresh: invalidate cache then fall through to build
+    if force:
+        from utils.constants import CACHE_TTL_STATS
+        from utils.cache_manager import cache_manager
+        cache_manager.invalidate(CACHE_TTL_STATS, "stats", region, timespan)
+    else:
+        # Cache hit → immediate response
+        cached = get_cached_stats(region, timespan)
+        if cached is not None:
+            return _wrap_v2(cached)
 
     # Already building → tell client to poll
     if is_building(region, timespan):
