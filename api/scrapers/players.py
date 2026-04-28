@@ -475,7 +475,7 @@ async def vlr_player(player_id: str, timespan: str = "90d") -> dict:
     async def build():
         url = f"{VLR_BASE_URL}/player/{player_id}/?timespan={timespan}"
         client = get_http_client()
-        resp = await fetch_with_retries(url, client=client)
+        resp = await fetch_with_retries(url, client=client, timeout=10, max_retries=1)
         status = resp.status_code
 
         html = HTMLParser(resp.text)
@@ -524,7 +524,7 @@ async def vlr_player_matches(player_id: str, page: int = 1) -> dict:
     async def build():
         url = f"{VLR_BASE_URL}/player/matches/{player_id}/?page={page}"
         client = get_http_client()
-        resp = await fetch_with_retries(url, client=client)
+        resp = await fetch_with_retries(url, client=client, timeout=10, max_retries=1)
         status = resp.status_code
 
         html = HTMLParser(resp.text)
