@@ -9,6 +9,41 @@ from utils.cache_manager import cache_manager
 from utils.error_handling import handle_scraper_errors, validate_region, validate_timespan
 from utils.html_parsers import extract_text_content
 
+# ── Background job tracking ───────────────────────────────────────────────────
+_building: set[str] = set()
+
+def _job_key(region_key: str, timespan: str) -> str:
+    return f"stats:{region_key}:{timespan}"
+
+def get_cached_stats(region_key: str, timespan: str):
+    """Return cached stats payload or None."""
+    return cache_manager.get(CACHE_TTL_STATS, "stats", region_key, timespan)
+
+def is_building(region_key: str, timespan: str) -> bool:
+    """Return True if a background scrape is in progress."""
+    return _job_key(region_key, timespan) in _building
+
+async def _background_build(region_key: str, timespan: str):
+    key = _job_key(region_key, timespan)
+    try:
+        await vlr_stats(region_key, timespan)
+        logger.info("Background stats build complete: %s", key)
+    except Exception as exc:
+        logger.error("Background stats build failed for %s: %s", key, exc)
+    finally:
+        _building.discard(key)
+
+def start_background_build(region_key: str, timespan: str) -> bool:
+    """Fire a background scrape task. Returns False if one is already running."""
+    key = _job_key(region_key, timespan)
+    if key in _building:
+        return False
+    _building.add(key)
+    asyncio.create_task(_background_build(region_key, timespan))
+    logger.info("Background stats build started: %s", key)
+    return True
+# ─────────────────────────────────────────────────────────────────────────────
+
 logger = logging.getLogger(__name__)
 
 # Regions that map to different VLR.gg region codes
@@ -122,7 +157,7 @@ def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
 async def _fetch_rows(url: str, client, semaphore: asyncio.Semaphore) -> list:
     async with semaphore:
         try:
-            resp = await fetch_with_retries(url, client=client, timeout=8, max_retries=1)
+            resp = await fetch_with_retries(url, client=client, timeout=15, max_retries=1)
             if resp.status_code != 200:
                 return []
             html = HTMLParser(resp.text)

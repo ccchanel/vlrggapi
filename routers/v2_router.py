@@ -2,6 +2,7 @@
 V2 API router — standardized responses, validation, Pydantic models.
 """
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -21,12 +22,15 @@ from routers.shared_handlers import (
     get_team_matches_data,
     get_team_transactions_data,
 )
+from api.scrapers.stats import get_cached_stats, is_building, start_background_build
 from utils.constants import RATE_LIMIT, MAX_MATCH_QUERY_BOUND
 from utils.error_handling import (
     validate_event_query,
     validate_match_query,
     validate_match_workload,
     validate_player_timespan,
+    validate_region,
+    validate_timespan,
     validate_id_param,
 )
 
@@ -57,7 +61,7 @@ async def v2_news(request: Request):
     return _wrap_v2(result)
 
 
-@router.get("/stats", response_model=V2Response)
+@router.get("/stats")
 @limiter.limit(RATE_LIMIT)
 async def v2_stats(
     request: Request,
@@ -66,11 +70,25 @@ async def v2_stats(
 ):
     """
     Get player statistics for a region and timespan.
-
-    Region shortnames: na, eu, ap, la, la-s, la-n, oce, kr, mn, gc, br, cn, jp, col
+    Returns 200 with data when cached, or 202 {"status":"building"} while scraping.
+    Poll the same endpoint every few seconds until you get 200.
     """
-    result = await get_stats_data(region, timespan)
-    return _wrap_v2(result)
+    # Validate params eagerly so bad input still gets 400
+    validate_region(region)
+    validate_timespan(timespan)
+
+    # Cache hit → immediate response
+    cached = get_cached_stats(region, timespan)
+    if cached is not None:
+        return _wrap_v2(cached)
+
+    # Already building → tell client to poll
+    if is_building(region, timespan):
+        return JSONResponse({"status": "building"}, status_code=202)
+
+    # Cold cache → fire background scrape, tell client to poll
+    start_background_build(region, timespan)
+    return JSONResponse({"status": "building"}, status_code=202)
 
 
 @router.get("/rankings", response_model=V2Response)
