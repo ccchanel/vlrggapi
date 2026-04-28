@@ -10,6 +10,16 @@ from utils.html_parsers import extract_text_content
 
 logger = logging.getLogger(__name__)
 
+# VCT restructured into circuits — these regions no longer filter cleanly via the
+# ?region= param alone. We discover their event_group_id from the stats page dropdown
+# so we get the right circuit data (same technique as GC).
+CIRCUIT_KEYWORDS = {
+    "eu": ["emea"],
+    "na": ["americas"],
+    "ap": ["pacific"],
+    "gc": ["game changer"],
+}
+
 
 def _cell_text(cells: list, index: int) -> str:
     """Read a table cell by index without raising on sparse rows."""
@@ -64,16 +74,19 @@ def _parse_stats_row(item) -> dict:
     }
 
 
-async def _find_gc_event_group_id(client) -> str:
-    """Fetch the VLR.gg stats page and parse the event_group_id for Game Changers."""
+async def _find_event_group_id(client, keywords: list[str]) -> str:
+    """Fetch the VLR.gg stats page and find an event_group_id matching any keyword."""
     resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
     html = HTMLParser(resp.text)
     select = html.css_first("select[name='event_group_id']")
     if select:
         for option in select.css("option"):
             text = (option.text() or "").strip().lower()
-            if "game changer" in text:
-                return option.attributes.get("value", "all")
+            if any(kw in text for kw in keywords):
+                val = option.attributes.get("value", "all")
+                logger.info("Matched event_group_id=%s for keywords=%s (text=%r)", val, keywords, text)
+                return val
+    logger.warning("No event_group_id match for keywords=%s, falling back to 'all'", keywords)
     return "all"
 
 
@@ -85,19 +98,26 @@ async def vlr_stats(region_key: str, timespan: str):
 
         client = get_http_client()
 
-        if region_key == "gc":
-            gc_eid = await _find_gc_event_group_id(client)
+        if region_key in CIRCUIT_KEYWORDS:
+            # VCT circuits and GC: discover event_group_id from the stats page dropdown.
+            # Using event_group_id gives clean per-circuit results; region=all ensures we
+            # don't accidentally double-filter and miss players.
+            eid = await _find_event_group_id(client, CIRCUIT_KEYWORDS[region_key])
+            min_rounds = 50 if region_key == "gc" else 100
             base_url = (
-                f"{VLR_STATS_URL}/?event_group_id={gc_eid}&event_id=all"
-                f"&region=all&country=all&min_rounds=50"
+                f"{VLR_STATS_URL}/?event_group_id={eid}&event_id=all"
+                f"&region=all&country=all&min_rounds={min_rounds}"
                 f"&min_rating=1550&agent=all&map_id=all"
             )
         else:
+            # Smaller / regional circuits (kr, jp, br, la, oce, mn, col, etc.)
+            # still use the region parameter which works for these.
             base_url = (
                 f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
                 f"&region={region_key}&country=all&min_rounds=200"
                 f"&min_rating=1550&agent=all&map_id=all"
             )
+
         url = (
             f"{base_url}&timespan=all"
             if timespan.lower() == "all"
