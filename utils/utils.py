@@ -13,7 +13,7 @@ region = {
     "oce": "oceania",
     "kr": "korea",
     "mn": "mena",
-    "gc": "gc",
+    "gc": "game-changers",
     "br": "Brazil",
     "cn": "china",
     "jp": "japan",

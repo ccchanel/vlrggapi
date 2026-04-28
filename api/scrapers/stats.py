@@ -67,12 +67,12 @@ def _parse_stats_row(item) -> dict:
 @handle_scraper_errors
 async def vlr_stats(region_key: str, timespan: str):
     async def build():
-        validate_region(region_key)
+        region_name = validate_region(region_key)
         validate_timespan(timespan)
 
         base_url = (
             f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
-            f"&region={region_key}&country=all&min_rounds=200"
+            f"&region={region_name}&country=all&min_rounds=200"
             f"&min_rating=1550&agent=all&map_id=all"
         )
         url = (
