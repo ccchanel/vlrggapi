@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from selectolax.parser import HTMLParser
@@ -10,21 +11,18 @@ from utils.html_parsers import extract_text_content
 
 logger = logging.getLogger(__name__)
 
-# Regions that are part of the global VCT circuit (Americas/EMEA/Pacific).
-# These need event_group_id filtering to work — using region= alone with
-# event_group_id=all returns all players globally.
+# VCT circuits: region= alone with event_group_id=all returns global garbage.
+# Must pair a specific event_group_id with region= to get proper regional data.
 VCT_REGIONS = {"na", "eu", "ap"}
 
 
 def _cell_text(cells: list, index: int) -> str:
-    """Read a table cell by index without raising on sparse rows."""
     if index >= len(cells):
         return ""
     return extract_text_content(cells[index])
 
 
 def _parse_stats_row(item) -> dict:
-    """Parse one stats table row using table-cell structure, not flattened text."""
     cells = item.css("td")
     player_cell = item.css_first("td.mod-player")
 
@@ -71,14 +69,14 @@ def _parse_stats_row(item) -> dict:
 
 async def _discover_event_groups(client) -> dict:
     """
-    Parse the VLR.gg stats page dropdown once to find the latest event_group_id
-    for the main VCT circuit and for Game Changers.
+    Parse the VLR.gg stats page dropdown once to discover current event_group_ids.
     Options are listed newest-first so first match = current season.
+    Returns ids for: vct, challengers, gc.
     """
     resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
     html = HTMLParser(resp.text)
     select = html.css_first("select[name='event_group_id']")
-    groups = {"vct": "all", "gc": "all"}
+    groups = {"vct": "all", "challengers": "all", "gc": "all"}
     if select:
         for option in select.css("option"):
             text = (option.text() or "").strip().lower()
@@ -87,7 +85,10 @@ async def _discover_event_groups(client) -> dict:
                 continue
             if "game changer" in text and groups["gc"] == "all":
                 groups["gc"] = val
-                logger.info("Found GC event_group_id=%s (%s)", val, text)
+                logger.info("GC event_group_id=%s (%s)", val, text)
+            elif "challengers league" in text and groups["challengers"] == "all":
+                groups["challengers"] = val
+                logger.info("Challengers event_group_id=%s (%s)", val, text)
             elif (
                 "valorant champions tour" in text
                 and "game changer" not in text
@@ -95,10 +96,28 @@ async def _discover_event_groups(client) -> dict:
                 and groups["vct"] == "all"
             ):
                 groups["vct"] = val
-                logger.info("Found VCT event_group_id=%s (%s)", val, text)
-            if groups["vct"] != "all" and groups["gc"] != "all":
-                break  # found both, stop scanning
+                logger.info("VCT event_group_id=%s (%s)", val, text)
+            if all(v != "all" for v in groups.values()):
+                break
     return groups
+
+
+async def _fetch_rows(url: str, client) -> list:
+    """Fetch a stats page URL and return parsed player rows."""
+    try:
+        resp = await fetch_with_retries(url, client=client)
+        if resp.status_code != 200:
+            return []
+        html = HTMLParser(resp.text)
+        rows = []
+        for item in html.css("tbody tr"):
+            parsed = _parse_stats_row(item)
+            if parsed["player"]:
+                rows.append(parsed)
+        return rows
+    except Exception as exc:
+        logger.warning("Failed to fetch %s: %s", url, exc)
+        return []
 
 
 @handle_scraper_errors
@@ -108,59 +127,55 @@ async def vlr_stats(region_key: str, timespan: str):
         validate_timespan(timespan)
 
         client = get_http_client()
+        ts = "all" if timespan.lower() == "all" else f"{timespan}d"
 
-        if region_key == "gc" or region_key in VCT_REGIONS:
-            # GC and main VCT circuits (NA/EU/AP) all need a specific event_group_id
-            # for VLR.gg to apply server-side filtering. With event_group_id=all the
-            # region param is silently ignored and all players are returned.
+        if region_key == "gc":
             groups = await _discover_event_groups(client)
+            url = (
+                f"{VLR_STATS_URL}/?event_group_id={groups['gc']}&event_id=all"
+                f"&region=gc&country=all&min_rounds=50"
+                f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
+            )
+            rows = await _fetch_rows(url, client)
 
-            if region_key == "gc":
-                eid = groups["gc"]
-                # GC players span all regions — use region=gc (valid dropdown value)
-                base_url = (
-                    f"{VLR_STATS_URL}/?event_group_id={eid}&event_id=all"
-                    f"&region=gc&country=all&min_rounds=50"
-                    f"&min_rating=1550&agent=all&map_id=all"
-                )
-            else:
-                eid = groups["vct"]
-                # VCT regions: pair the VCT event group with the specific region tag
-                base_url = (
-                    f"{VLR_STATS_URL}/?event_group_id={eid}&event_id=all"
-                    f"&region={region_key}&country=all&min_rounds=100"
-                    f"&min_rating=1550&agent=all&map_id=all"
-                )
+        elif region_key in VCT_REGIONS:
+            # Fetch VCT (top circuit) + Challengers (broader pool) in parallel,
+            # then merge — deduplicating by player_id so each player appears once.
+            groups = await _discover_event_groups(client)
+            vct_url = (
+                f"{VLR_STATS_URL}/?event_group_id={groups['vct']}&event_id=all"
+                f"&region={region_key}&country=all&min_rounds=0"
+                f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
+            )
+            chal_url = (
+                f"{VLR_STATS_URL}/?event_group_id={groups['challengers']}&event_id=all"
+                f"&region={region_key}&country=all&min_rounds=20"
+                f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
+            )
+            vct_rows, chal_rows = await asyncio.gather(
+                _fetch_rows(vct_url, client),
+                _fetch_rows(chal_url, client),
+            )
+            # VCT entries take priority; Challengers fills in the rest
+            seen_ids = {r["player_id"] for r in vct_rows if r["player_id"]}
+            seen_names = {r["player"] for r in vct_rows}
+            extras = [
+                r for r in chal_rows
+                if (r["player_id"] and r["player_id"] not in seen_ids)
+                or (not r["player_id"] and r["player"] not in seen_names)
+            ]
+            rows = vct_rows + extras
+
         else:
             # Smaller / regional circuits (kr, jp, br, la, oce, mn, col, etc.)
-            # These still filter correctly via the region param alone.
-            base_url = (
+            url = (
                 f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
                 f"&region={region_key}&country=all&min_rounds=200"
-                f"&min_rating=1550&agent=all&map_id=all"
+                f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
             )
+            rows = await _fetch_rows(url, client)
 
-        url = (
-            f"{base_url}&timespan=all"
-            if timespan.lower() == "all"
-            else f"{base_url}&timespan={timespan}d"
-        )
-
-        resp = await fetch_with_retries(url, client=client)
-        html = HTMLParser(resp.text)
-        status = resp.status_code
-
-        result = []
-        for item in html.css("tbody tr"):
-            parsed = _parse_stats_row(item)
-            if parsed["player"]:
-                result.append(parsed)
-
-        data = {"data": {"status": status, "segments": result}}
-
-        if status != 200:
-            raise Exception("API response: {}".format(status))
-
+        data = {"data": {"status": 200, "segments": rows}}
         return data
 
     return await cache_manager.get_or_create_async(
