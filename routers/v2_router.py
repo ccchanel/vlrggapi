@@ -248,3 +248,23 @@ async def v2_health():
     """Check API health and runtime readiness."""
     result = await get_health_data()
     return {"status": "success", "data": result}
+
+
+@router.get("/debug/event-groups")
+async def v2_debug_event_groups():
+    """Dump all event_group_id and region dropdown options from VLR.gg stats page."""
+    from selectolax.parser import HTMLParser
+    from utils.http_client import fetch_with_retries, get_http_client
+    from utils.constants import VLR_STATS_URL
+    client = get_http_client()
+    resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
+    html = HTMLParser(resp.text)
+    result = {}
+    for sel_name in ("event_group_id", "region", "series_id"):
+        sel = html.css_first(f"select[name='{sel_name}']")
+        if sel:
+            result[sel_name] = [
+                {"value": o.attributes.get("value", ""), "text": (o.text() or "").strip()}
+                for o in sel.css("option")
+            ]
+    return {"status": "success", "data": result}
