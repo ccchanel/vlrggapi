@@ -15,14 +15,10 @@ logger = logging.getLogger(__name__)
 VLR_REGION_MAP = {
     "la-s": "las",
     "la-n": "lan",
-    "col":  "cg",
 }
 
 # "la" splits into las + lan
 LA_COMBINED = {"la"}
-
-# Max concurrent requests to VLR.gg to avoid rate-limiting
-_SEMAPHORE_LIMIT = 12
 
 
 def _cell_text(cells: list, index: int) -> str:
@@ -76,70 +72,30 @@ def _parse_stats_row(item) -> dict:
     }
 
 
+def _stats_url(region: str, timespan: str) -> str:
+    ts = "all" if timespan.lower() == "all" else f"{timespan}d"
+    return (
+        f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
+        f"&region={region}&country=all&min_rounds=0"
+        f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
+    )
 
-import datetime
 
-
-def _is_recent_event(name: str, event_id: str) -> bool:
-    """
-    Return True if the event is recent enough to be worth scraping
-    (roughly the last 6 months). Strategy:
-      1. If the name contains a year, include only 2025 or 2026.
-      2. If no year in name, include if the numeric ID is >= 70
-         (IDs below 70 correspond to pre-2025 events).
-    """
-    now_year = datetime.datetime.utcnow().year
-    recent_years = {str(now_year), str(now_year - 1)}  # e.g. {"2025","2026"}
-
-    for year in ("2020", "2021", "2022", "2023", "2024", "2025", "2026"):
-        if year in name:
-            return year in recent_years
-
-    # No year found in name — use ID as a proxy for recency
+async def _fetch_rows(url: str, client) -> list:
     try:
-        return int(event_id) >= 70
-    except ValueError:
-        return True
-
-
-async def _discover_all_event_group_ids(client) -> list:
-    """
-    Fetch the VLR.gg stats page and return event_group_ids for all
-    events from roughly the last 6 months — every tournament type
-    included (VCT, Challengers, GC, FunhaverGG, etc.).
-    """
-    resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
-    html = HTMLParser(resp.text)
-    select = html.css_first("select[name='event_group_id']")
-    ids = []
-    if select:
-        for option in select.css("option"):
-            val = option.attributes.get("value", "all")
-            if val == "all":
-                continue
-            name = (option.text() or "").strip()
-            if _is_recent_event(name, val):
-                ids.append(val)
-    logger.info("Discovered %d recent event group IDs", len(ids))
-    return ids
-
-
-async def _fetch_rows(url: str, client, semaphore: asyncio.Semaphore) -> list:
-    async with semaphore:
-        try:
-            resp = await fetch_with_retries(url, client=client)
-            if resp.status_code != 200:
-                return []
-            html = HTMLParser(resp.text)
-            rows = []
-            for item in html.css("tbody tr"):
-                parsed = _parse_stats_row(item)
-                if parsed["player"]:
-                    rows.append(parsed)
-            return rows
-        except Exception as exc:
-            logger.warning("Failed to fetch %s: %s", url, exc)
+        resp = await fetch_with_retries(url, client=client)
+        if resp.status_code != 200:
             return []
+        html = HTMLParser(resp.text)
+        rows = []
+        for item in html.css("tbody tr"):
+            parsed = _parse_stats_row(item)
+            if parsed["player"]:
+                rows.append(parsed)
+        return rows
+    except Exception as exc:
+        logger.warning("Failed to fetch %s: %s", url, exc)
+        return []
 
 
 def _merge(primary: list, secondary: list) -> list:
@@ -154,29 +110,6 @@ def _merge(primary: list, secondary: list) -> list:
     return primary + extras
 
 
-def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
-    return (
-        f"{VLR_STATS_URL}/?event_group_id={event_group_id}&event_id=all"
-        f"&region={region}&country=all&min_rounds=0"
-        f"&min_rating=1550&agent=all&map_id=all&timespan={timespan}"
-    )
-
-
-async def _fetch_all_for_region(region: str, timespan: str, all_ids: list, client) -> list:
-    """
-    Fetch stats from every event group for a single region and merge.
-    Uses a semaphore to avoid hammering VLR.gg.
-    """
-    semaphore = asyncio.Semaphore(_SEMAPHORE_LIMIT)
-    urls = [_stats_url(eid, region, timespan) for eid in all_ids]
-    results = await asyncio.gather(*[_fetch_rows(u, client, semaphore) for u in urls])
-
-    merged = []
-    for rows in results:
-        merged = _merge(merged, rows)
-    return merged
-
-
 @handle_scraper_errors
 async def vlr_stats(region_key: str, timespan: str):
     async def build():
@@ -184,26 +117,21 @@ async def vlr_stats(region_key: str, timespan: str):
         validate_timespan(timespan)
 
         client = get_http_client()
-        ts = "all" if timespan.lower() == "all" else f"{timespan}d"
-
-        # Get every event group ID from the dropdown
-        all_ids = await _discover_all_event_group_ids(client)
 
         if region_key == "gc":
-            # Game Changers: use region=gc across all event groups
-            rows = await _fetch_all_for_region("gc", ts, all_ids, client)
+            rows = await _fetch_rows(_stats_url("gc", timespan), client)
 
         elif region_key in LA_COMBINED:
-            # "la" = las + lan combined across all event groups
+            # "la" = las + lan combined
             las_rows, lan_rows = await asyncio.gather(
-                _fetch_all_for_region("las", ts, all_ids, client),
-                _fetch_all_for_region("lan", ts, all_ids, client),
+                _fetch_rows(_stats_url("las", timespan), client),
+                _fetch_rows(_stats_url("lan", timespan), client),
             )
             rows = _merge(las_rows, lan_rows)
 
         else:
             vlr_region = VLR_REGION_MAP.get(region_key, region_key)
-            rows = await _fetch_all_for_region(vlr_region, ts, all_ids, client)
+            rows = await _fetch_rows(_stats_url(vlr_region, timespan), client)
 
         logger.info("vlr_stats(%s, %s): %d players", region_key, timespan, len(rows))
         return {"data": {"status": 200, "segments": rows}}

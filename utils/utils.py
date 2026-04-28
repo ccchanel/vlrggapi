@@ -10,12 +10,9 @@ region = {
     "la": "latin-america",
     "la-s": "la-s",
     "la-n": "la-n",
-    "oce": "oceania",
     "kr": "korea",
-    "mn": "mena",
     "gc": "gc",
     "br": "Brazil",
     "cn": "china",
     "jp": "japan",
-    "col": "collegiate",
 }
