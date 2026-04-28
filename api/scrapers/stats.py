@@ -20,6 +20,9 @@ VLR_REGION_MAP = {
 # "la" splits into las + lan
 LA_COMBINED = {"la"}
 
+# Concurrent requests — high enough to be fast, low enough to avoid rate-limiting
+_SEMAPHORE_LIMIT = 20
+
 
 def _cell_text(cells: list, index: int) -> str:
     if index >= len(cells):
@@ -72,30 +75,46 @@ def _parse_stats_row(item) -> dict:
     }
 
 
-def _stats_url(region: str, timespan: str) -> str:
+async def _discover_all_event_group_ids(client) -> list:
+    """Fetch all event_group_id values from the VLR.gg stats dropdown."""
+    resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
+    html = HTMLParser(resp.text)
+    select = html.css_first("select[name='event_group_id']")
+    ids = []
+    if select:
+        for option in select.css("option"):
+            val = option.attributes.get("value", "all")
+            if val != "all":
+                ids.append(val)
+    logger.info("Discovered %d total event group IDs", len(ids))
+    return ids
+
+
+def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
     ts = "all" if timespan.lower() == "all" else f"{timespan}d"
     return (
-        f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
+        f"{VLR_STATS_URL}/?event_group_id={event_group_id}&event_id=all"
         f"&region={region}&country=all&min_rounds=0"
         f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
     )
 
 
-async def _fetch_rows(url: str, client) -> list:
-    try:
-        resp = await fetch_with_retries(url, client=client)
-        if resp.status_code != 200:
+async def _fetch_rows(url: str, client, semaphore: asyncio.Semaphore) -> list:
+    async with semaphore:
+        try:
+            resp = await fetch_with_retries(url, client=client)
+            if resp.status_code != 200:
+                return []
+            html = HTMLParser(resp.text)
+            rows = []
+            for item in html.css("tbody tr"):
+                parsed = _parse_stats_row(item)
+                if parsed["player"]:
+                    rows.append(parsed)
+            return rows
+        except Exception as exc:
+            logger.warning("Failed to fetch %s: %s", url, exc)
             return []
-        html = HTMLParser(resp.text)
-        rows = []
-        for item in html.css("tbody tr"):
-            parsed = _parse_stats_row(item)
-            if parsed["player"]:
-                rows.append(parsed)
-        return rows
-    except Exception as exc:
-        logger.warning("Failed to fetch %s: %s", url, exc)
-        return []
 
 
 def _merge(primary: list, secondary: list) -> list:
@@ -110,6 +129,16 @@ def _merge(primary: list, secondary: list) -> list:
     return primary + extras
 
 
+async def _fetch_all_for_region(region: str, timespan: str, all_ids: list, client) -> list:
+    semaphore = asyncio.Semaphore(_SEMAPHORE_LIMIT)
+    urls = [_stats_url(eid, region, timespan) for eid in all_ids]
+    results = await asyncio.gather(*[_fetch_rows(u, client, semaphore) for u in urls])
+    merged = []
+    for rows in results:
+        merged = _merge(merged, rows)
+    return merged
+
+
 @handle_scraper_errors
 async def vlr_stats(region_key: str, timespan: str):
     async def build():
@@ -117,21 +146,21 @@ async def vlr_stats(region_key: str, timespan: str):
         validate_timespan(timespan)
 
         client = get_http_client()
+        all_ids = await _discover_all_event_group_ids(client)
 
         if region_key == "gc":
-            rows = await _fetch_rows(_stats_url("gc", timespan), client)
+            rows = await _fetch_all_for_region("gc", timespan, all_ids, client)
 
         elif region_key in LA_COMBINED:
-            # "la" = las + lan combined
             las_rows, lan_rows = await asyncio.gather(
-                _fetch_rows(_stats_url("las", timespan), client),
-                _fetch_rows(_stats_url("lan", timespan), client),
+                _fetch_all_for_region("las", timespan, all_ids, client),
+                _fetch_all_for_region("lan", timespan, all_ids, client),
             )
             rows = _merge(las_rows, lan_rows)
 
         else:
             vlr_region = VLR_REGION_MAP.get(region_key, region_key)
-            rows = await _fetch_rows(_stats_url(vlr_region, timespan), client)
+            rows = await _fetch_all_for_region(vlr_region, timespan, all_ids, client)
 
         logger.info("vlr_stats(%s, %s): %d players", region_key, timespan, len(rows))
         return {"data": {"status": 200, "segments": rows}}
