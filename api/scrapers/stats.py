@@ -11,19 +11,22 @@ from utils.html_parsers import extract_text_content
 
 logger = logging.getLogger(__name__)
 
-# VCT circuits: region= alone with event_group_id=all returns global garbage.
-# Must pair a specific event_group_id with region= to get proper regional data.
+# All these regions need a specific event_group_id paired with their region code —
+# event_group_id=all silently returns global data regardless of region= value.
 VCT_REGIONS = {"na", "eu", "ap"}
 
-# VLR.gg stats URL uses different region codes than our API keys.
-# "la" (generic Latin America) is not a valid VLR.gg region — split into las+lan.
+# These regions also need event_group_id filtering but don't have a VCT top-league
+# entry — Challengers alone is sufficient.
+CHAL_ONLY_REGIONS = {"la-s", "la-n", "br", "kr", "jp", "oce", "mn", "cn", "col"}
+
+# VLR.gg stats URL region codes differ from our API keys for some regions
 VLR_REGION_MAP = {
     "la-s": "las",
     "la-n": "lan",
     "col": "cg",
 }
 
-# Regions that need two requests (las + lan) to cover all of Latin America
+# "la" isn't a VLR.gg region — we split it into las + lan
 LA_COMBINED = {"la"}
 
 
@@ -80,9 +83,8 @@ def _parse_stats_row(item) -> dict:
 
 async def _discover_event_groups(client) -> dict:
     """
-    Parse the VLR.gg stats page dropdown once to discover current event_group_ids.
+    Parse the VLR.gg stats page dropdown to find current event_group_ids.
     Options are listed newest-first so first match = current season.
-    Returns ids for: vct, challengers, gc.
     """
     resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
     html = HTMLParser(resp.text)
@@ -96,10 +98,8 @@ async def _discover_event_groups(client) -> dict:
                 continue
             if "game changer" in text and groups["gc"] == "all":
                 groups["gc"] = val
-                logger.info("GC event_group_id=%s (%s)", val, text)
             elif "challengers league" in text and groups["challengers"] == "all":
                 groups["challengers"] = val
-                logger.info("Challengers event_group_id=%s (%s)", val, text)
             elif (
                 "valorant champions tour" in text
                 and "game changer" not in text
@@ -108,14 +108,13 @@ async def _discover_event_groups(client) -> dict:
                 and groups["vct"] == "all"
             ):
                 groups["vct"] = val
-                logger.info("VCT event_group_id=%s (%s)", val, text)
             if all(v != "all" for v in groups.values()):
                 break
+    logger.info("Discovered event groups: %s", groups)
     return groups
 
 
 async def _fetch_rows(url: str, client) -> list:
-    """Fetch a stats page URL and return parsed player rows."""
     try:
         resp = await fetch_with_retries(url, client=client)
         if resp.status_code != 200:
@@ -132,6 +131,26 @@ async def _fetch_rows(url: str, client) -> list:
         return []
 
 
+def _merge(primary: list, secondary: list) -> list:
+    """Merge two player lists, deduplicating by player_id then name."""
+    seen_ids = {r["player_id"] for r in primary if r["player_id"]}
+    seen_names = {r["player"] for r in primary}
+    extras = [
+        r for r in secondary
+        if (r["player_id"] and r["player_id"] not in seen_ids)
+        or (not r["player_id"] and r["player"] not in seen_names)
+    ]
+    return primary + extras
+
+
+def _chal_url(eid: str, region: str, ts: str) -> str:
+    return (
+        f"{VLR_STATS_URL}/?event_group_id={eid}&event_id=all"
+        f"&region={region}&country=all&min_rounds=0"
+        f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
+    )
+
+
 @handle_scraper_errors
 async def vlr_stats(region_key: str, timespan: str):
     async def build():
@@ -140,78 +159,44 @@ async def vlr_stats(region_key: str, timespan: str):
 
         client = get_http_client()
         ts = "all" if timespan.lower() == "all" else f"{timespan}d"
+        groups = await _discover_event_groups(client)
 
         if region_key == "gc":
-            groups = await _discover_event_groups(client)
-            url = (
-                f"{VLR_STATS_URL}/?event_group_id={groups['gc']}&event_id=all"
-                f"&region=gc&country=all&min_rounds=50"
-                f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
-            )
-            rows = await _fetch_rows(url, client)
+            rows = await _fetch_rows(_chal_url(groups["gc"], "gc", ts), client)
 
         elif region_key in VCT_REGIONS:
-            # Fetch VCT (top circuit) + Challengers (broader pool) in parallel,
-            # then merge — deduplicating by player_id so each player appears once.
-            groups = await _discover_event_groups(client)
-            vct_url = (
-                f"{VLR_STATS_URL}/?event_group_id={groups['vct']}&event_id=all"
-                f"&region={region_key}&country=all&min_rounds=0"
-                f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
-            )
-            chal_url = (
-                f"{VLR_STATS_URL}/?event_group_id={groups['challengers']}&event_id=all"
-                f"&region={region_key}&country=all&min_rounds=0"
-                f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
-            )
+            # VCT top league + Challengers in parallel for full coverage
+            vct_url = _chal_url(groups["vct"], region_key, ts)
+            chal_url = _chal_url(groups["challengers"], region_key, ts)
             vct_rows, chal_rows = await asyncio.gather(
                 _fetch_rows(vct_url, client),
                 _fetch_rows(chal_url, client),
             )
-            # VCT entries take priority; Challengers fills in the rest
-            seen_ids = {r["player_id"] for r in vct_rows if r["player_id"]}
-            seen_names = {r["player"] for r in vct_rows}
-            extras = [
-                r for r in chal_rows
-                if (r["player_id"] and r["player_id"] not in seen_ids)
-                or (not r["player_id"] and r["player"] not in seen_names)
-            ]
-            rows = vct_rows + extras
+            rows = _merge(vct_rows, chal_rows)
+
+        elif region_key in CHAL_ONLY_REGIONS:
+            # Challengers covers these regions — event_group_id=all doesn't filter properly
+            vlr_region = VLR_REGION_MAP.get(region_key, region_key)
+            rows = await _fetch_rows(_chal_url(groups["challengers"], vlr_region, ts), client)
 
         elif region_key in LA_COMBINED:
-            # "la" is not a valid VLR.gg region — fetch las + lan in parallel and merge
-            def _la_url(r):
-                return (
-                    f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
-                    f"&region={r}&country=all&min_rounds=50"
-                    f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
-                )
+            # "la" = las + lan combined
             las_rows, lan_rows = await asyncio.gather(
-                _fetch_rows(_la_url("las"), client),
-                _fetch_rows(_la_url("lan"), client),
+                _fetch_rows(_chal_url(groups["challengers"], "las", ts), client),
+                _fetch_rows(_chal_url(groups["challengers"], "lan", ts), client),
             )
-            seen_ids = {r["player_id"] for r in las_rows if r["player_id"]}
-            seen_names = {r["player"] for r in las_rows}
-            extras = [
-                r for r in lan_rows
-                if (r["player_id"] and r["player_id"] not in seen_ids)
-                or (not r["player_id"] and r["player"] not in seen_names)
-            ]
-            rows = las_rows + extras
+            rows = _merge(las_rows, lan_rows)
 
         else:
-            # Remaining regional circuits (kr, jp, br, la-s, la-n, oce, mn, col, cn)
-            # Map region key to VLR.gg's actual param value where they differ
             vlr_region = VLR_REGION_MAP.get(region_key, region_key)
-            url = (
+            rows = await _fetch_rows(
                 f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
-                f"&region={vlr_region}&country=all&min_rounds=50"
-                f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
+                f"&region={vlr_region}&country=all&min_rounds=0"
+                f"&min_rating=1550&agent=all&map_id=all&timespan={ts}",
+                client,
             )
-            rows = await _fetch_rows(url, client)
 
-        data = {"data": {"status": 200, "segments": rows}}
-        return data
+        return {"data": {"status": 200, "segments": rows}}
 
     return await cache_manager.get_or_create_async(
         CACHE_TTL_STATS, build, "stats", region_key, timespan
