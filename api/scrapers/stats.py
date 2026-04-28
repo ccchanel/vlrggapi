@@ -41,15 +41,13 @@ async def _background_build(region_key: str, timespan: str):
             vlr_stats(region_key, timespan),
             timeout=_BUILD_HARD_TIMEOUT,
         )
-        # If the scrape succeeded but returned 0 players, treat as failure
-        # so the polling client doesn't loop forever on empty data.
         segments = (result or {}).get("data", {}).get("segments", [])
-        if not segments:
-            logger.warning("Background stats build returned 0 players: %s", key)
-            _failed_builds[key] = time.time()
-        else:
-            _failed_builds.pop(key, None)
-            logger.info("Background stats build complete: %s (%d players)", key, len(segments))
+        # Empty results are LEGITIMATE (e.g. GC has no recent tournaments,
+        # niche timespan with no matches) — they're cached and the frontend
+        # will surface them as "no players found". Only real exceptions
+        # / timeouts count as failures.
+        _failed_builds.pop(key, None)
+        logger.info("Background stats build complete: %s (%d players)", key, len(segments))
     except asyncio.TimeoutError:
         logger.error("Background stats build TIMED OUT after %ds: %s", _BUILD_HARD_TIMEOUT, key)
         _failed_builds[key] = time.time()
@@ -242,6 +240,24 @@ async def _fetch_all_for_region(region: str, timespan: str, ids: list, client) -
     return merged
 
 
+async def _safe_discover(client) -> tuple[list, list]:
+    """Discover event group IDs; on failure, return empty lists rather than raising."""
+    try:
+        return await _discover_event_group_ids(client)
+    except Exception as exc:
+        logger.warning("Event-group discovery failed (continuing with fallback): %s", exc)
+        return [], []
+
+
+async def _fetch_single_all(region: str, timespan: str, client) -> list:
+    """Single-shot stats fetch using event_group_id=all. Used as a fallback when
+    per-event-group scraping returns nothing or discovery fails. The region
+    filter is applied server-side and is reliable for GC; for other regions
+    it tends to leak across regions (which is why we normally avoid it)."""
+    semaphore = asyncio.Semaphore(1)
+    return await _fetch_rows(_stats_url("all", region, timespan), client, semaphore)
+
+
 @handle_scraper_errors
 async def vlr_stats(region_key: str, timespan: str):
     async def build():
@@ -249,24 +265,42 @@ async def vlr_stats(region_key: str, timespan: str):
         validate_timespan(timespan)
 
         client = get_http_client()
-        open_ids, gc_ids = await _discover_event_group_ids(client)
+        open_ids, gc_ids = await _safe_discover(client)
 
         if region_key == "gc":
-            # GC region: only scrape GC-tagged event groups
-            rows = await _fetch_all_for_region("gc", timespan, gc_ids, client)
+            # 1. Try the per-event-group scrape using GC-tagged events
+            rows = await _fetch_all_for_region("gc", timespan, gc_ids, client) if gc_ids else []
+            # 2. If the keyword filter found nothing OR all GC events were empty,
+            #    fall back to a single event_group_id=all&region=gc request.
+            if not rows:
+                rows = await _fetch_single_all("gc", timespan, client)
+            # 3. As a last resort scan EVERY event group with region=gc — slower
+            #    but guaranteed to surface any GC players present.
+            if not rows and (open_ids or gc_ids):
+                all_ids = open_ids + gc_ids
+                rows = await _fetch_all_for_region("gc", timespan, all_ids, client)
 
         elif region_key in LA_COMBINED:
-            # "la" = las + lan, non-GC events only
-            las_rows, lan_rows = await asyncio.gather(
-                _fetch_all_for_region("las", timespan, open_ids, client),
-                _fetch_all_for_region("lan", timespan, open_ids, client),
-            )
-            rows = _merge(las_rows, lan_rows)
+            if open_ids:
+                las_rows, lan_rows = await asyncio.gather(
+                    _fetch_all_for_region("las", timespan, open_ids, client),
+                    _fetch_all_for_region("lan", timespan, open_ids, client),
+                )
+                rows = _merge(las_rows, lan_rows)
+            else:
+                # Discovery failed — single-shot fallback for both subregions
+                las_rows, lan_rows = await asyncio.gather(
+                    _fetch_single_all("las", timespan, client),
+                    _fetch_single_all("lan", timespan, client),
+                )
+                rows = _merge(las_rows, lan_rows)
 
         else:
             vlr_region = VLR_REGION_MAP.get(region_key, region_key)
-            # Non-GC regions: only scrape non-GC event groups
-            rows = await _fetch_all_for_region(vlr_region, timespan, open_ids, client)
+            if open_ids:
+                rows = await _fetch_all_for_region(vlr_region, timespan, open_ids, client)
+            else:
+                rows = await _fetch_single_all(vlr_region, timespan, client)
 
         logger.info("vlr_stats(%s, %s): %d players", region_key, timespan, len(rows))
         return {"data": {"status": 200, "segments": rows}}
