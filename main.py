@@ -25,12 +25,16 @@ async def lifespan(app: FastAPI):
     await close_http_client()
 
 
-app = FastAPI(
-    title=API_TITLE,
-    description=API_DESCRIPTION,
-    docs_url="/",
-    redoc_url=None,
-    lifespan=lifespan,
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 limiter = Limiter(key_func=get_remote_address)
