@@ -77,58 +77,36 @@ def _parse_stats_row(item) -> dict:
 
 
 
-# Keywords that identify major competitive events worth scraping.
-# Small/niche/college events are skipped to keep response times reasonable.
-_MAJOR_EVENT_KEYWORDS = (
-    "valorant champions tour",
-    "challengers league",
-    "game changers",
-    "partner series",
-    "off//season",
-    "china evolution series",
-    "project v",
-    "wave oce",
-    "beacon",
-    "fgc valorant",
-    "valorant east",
-    "red bull campus",
-    "riot games one",
-)
+import datetime
 
-_SKIP_KEYWORDS = (
-    "college",
-    "txg",
-    "braza",
-    "evc surge",
-    "exitlag",
-    "hyperx momentum",
-    "flyquest trailblazer",
-    "yfp lockdown",
-    "cbvl",
-    "raidiant academy",
-    "norwegian",
-    "insomnia",
-    "a1 esports",
-    "super girl gamer",
-    "community gaming",
-    "golden goose",
-    "nerd street",
-    "blast spike",
-    "trinity trials",
-    "mystic singularity",
-    "cecc",
-    "collegiate",
-    "saudi eleague",
-    "return of the titans",
-    "nom invitationals",
-    "balkan league",
-)
+
+def _is_recent_event(name: str, event_id: str) -> bool:
+    """
+    Return True if the event is recent enough to be worth scraping
+    (roughly the last 6 months). Strategy:
+      1. If the name contains a year, include only 2025 or 2026.
+      2. If no year in name, include if the numeric ID is >= 70
+         (IDs below 70 correspond to pre-2025 events).
+    """
+    now_year = datetime.datetime.utcnow().year
+    recent_years = {str(now_year), str(now_year - 1)}  # e.g. {"2025","2026"}
+
+    for year in ("2020", "2021", "2022", "2023", "2024", "2025", "2026"):
+        if year in name:
+            return year in recent_years
+
+    # No year found in name — use ID as a proxy for recency
+    try:
+        return int(event_id) >= 70
+    except ValueError:
+        return True
 
 
 async def _discover_all_event_group_ids(client) -> list:
     """
     Fetch the VLR.gg stats page and return event_group_ids for all
-    major competitive events (skips college/niche/one-off events).
+    events from roughly the last 6 months — every tournament type
+    included (VCT, Challengers, GC, FunhaverGG, etc.).
     """
     resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
     html = HTMLParser(resp.text)
@@ -139,17 +117,10 @@ async def _discover_all_event_group_ids(client) -> list:
             val = option.attributes.get("value", "all")
             if val == "all":
                 continue
-            name_lower = (option.text() or "").strip().lower()
-            # Skip known niche events
-            if any(skip in name_lower for skip in _SKIP_KEYWORDS):
-                continue
-            # Include known major events
-            if any(kw in name_lower for kw in _MAJOR_EVENT_KEYWORDS):
+            name = (option.text() or "").strip()
+            if _is_recent_event(name, val):
                 ids.append(val)
-                continue
-            # Include anything else that isn't clearly niche
-            ids.append(val)
-    logger.info("Discovered %d major event group IDs (from dropdown)", len(ids))
+    logger.info("Discovered %d recent event group IDs", len(ids))
     return ids
 
 
