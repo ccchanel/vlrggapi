@@ -81,6 +81,21 @@ _consecutive_timeouts = 0
 _CONSECUTIVE_TIMEOUT_THRESHOLD = 3
 
 
+async def _fetch_fresh(url: str, timeout: float) -> httpx.Response:
+    """One-shot fetch using a brand-new client.
+    Last-resort fallback for situations where the singleton pool
+    is unrecoverably wedged (silently dropped connections, half-open
+    sockets, etc). Slower per-call (~50ms TLS handshake), but bypasses
+    any shared state.
+    """
+    async with httpx.AsyncClient(
+        headers=headers,
+        timeout=httpx.Timeout(timeout),
+        follow_redirects=True,
+    ) as fresh:
+        return await fresh.get(url)
+
+
 async def fetch_with_retries(
     url: str,
     *,
@@ -91,29 +106,43 @@ async def fetch_with_retries(
 ) -> httpx.Response:
     """Fetch a URL with bounded retries for transient upstream failures.
 
-    If we hit several consecutive timeouts, the connection pool is
-    forcibly recycled — that recovers from situations where keepalive
-    sockets to the upstream have silently died.
+    If a request times out, immediately try once more with a fresh,
+    unshared client — bypassing any zombie connections in the pool.
     """
     global _consecutive_timeouts
     client = client or get_http_client()
     retries = max(1, max_retries)
     last_response: httpx.Response | None = None
+    effective_timeout = timeout if timeout is not None else 10.0
+    if isinstance(effective_timeout, httpx.Timeout):
+        effective_timeout = float(getattr(effective_timeout, "read", 10.0) or 10.0)
 
     for attempt in range(1, retries + 1):
         try:
             response = await client.get(url, timeout=timeout)
-            _consecutive_timeouts = 0  # success — clear streak
-        except httpx.TimeoutException as exc:
+            _consecutive_timeouts = 0
+        except httpx.TimeoutException:
             _consecutive_timeouts += 1
-            if _consecutive_timeouts >= _CONSECUTIVE_TIMEOUT_THRESHOLD:
+            # Last-ditch: try once with a brand-new client. If THAT also
+            # times out, the upstream is genuinely unreachable.
+            try:
                 logger.warning(
-                    "Hit %d consecutive timeouts — recycling HTTP client.",
-                    _consecutive_timeouts,
+                    "Pool fetch timed out for %s — trying fresh client.", url
                 )
-                await reset_http_client()
+                fresh_resp = await _fetch_fresh(url, float(effective_timeout))
                 _consecutive_timeouts = 0
-                client = get_http_client()
+                if _consecutive_timeouts >= _CONSECUTIVE_TIMEOUT_THRESHOLD:
+                    await reset_http_client()
+                    _consecutive_timeouts = 0
+                return fresh_resp
+            except Exception:
+                # Both pool and fresh client timed out — pool may be fine,
+                # the upstream is just down. Recycle the pool anyway and
+                # retry per the loop's normal retry budget.
+                if _consecutive_timeouts >= _CONSECUTIVE_TIMEOUT_THRESHOLD:
+                    await reset_http_client()
+                    _consecutive_timeouts = 0
+                    client = get_http_client()
             if attempt >= retries:
                 raise
             await asyncio.sleep(request_delay * (2 ** (attempt - 1)))
