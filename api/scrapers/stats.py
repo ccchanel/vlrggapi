@@ -3,7 +3,7 @@ import logging
 from selectolax.parser import HTMLParser
 
 from utils.http_client import fetch_with_retries, get_http_client
-from utils.constants import VLR_STATS_URL, CACHE_TTL_STATS
+from utils.constants import VLR_BASE_URL, VLR_STATS_URL, CACHE_TTL_STATS
 from utils.cache_manager import cache_manager
 from utils.error_handling import handle_scraper_errors, validate_region, validate_timespan
 from utils.html_parsers import extract_text_content
@@ -70,11 +70,11 @@ async def vlr_stats(region_key: str, timespan: str):
         validate_region(region_key)
         validate_timespan(timespan)
 
-        # GC stats live under the game-changers series filter, not a standard region
+        # GC has its own stats section at /game-changers/stats/, not the main stats page
         if region_key == "gc":
             base_url = (
-                f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
-                f"&series_id=game-changers&region=all&country=all&min_rounds=200"
+                f"{VLR_BASE_URL}/game-changers/stats/?event_group_id=all&event_id=all"
+                f"&region=all&country=all&min_rounds=200"
                 f"&min_rating=1550&agent=all&map_id=all"
             )
         else:
