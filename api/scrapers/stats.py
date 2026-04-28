@@ -22,7 +22,7 @@ VLR_REGION_MAP = {
 LA_COMBINED = {"la"}
 
 # Max concurrent requests to VLR.gg to avoid rate-limiting
-_SEMAPHORE_LIMIT = 8
+_SEMAPHORE_LIMIT = 12
 
 
 def _cell_text(cells: list, index: int) -> str:
@@ -76,10 +76,59 @@ def _parse_stats_row(item) -> dict:
     }
 
 
+
+# Keywords that identify major competitive events worth scraping.
+# Small/niche/college events are skipped to keep response times reasonable.
+_MAJOR_EVENT_KEYWORDS = (
+    "valorant champions tour",
+    "challengers league",
+    "game changers",
+    "partner series",
+    "off//season",
+    "china evolution series",
+    "project v",
+    "wave oce",
+    "beacon",
+    "fgc valorant",
+    "valorant east",
+    "red bull campus",
+    "riot games one",
+)
+
+_SKIP_KEYWORDS = (
+    "college",
+    "txg",
+    "braza",
+    "evc surge",
+    "exitlag",
+    "hyperx momentum",
+    "flyquest trailblazer",
+    "yfp lockdown",
+    "cbvl",
+    "raidiant academy",
+    "norwegian",
+    "insomnia",
+    "a1 esports",
+    "super girl gamer",
+    "community gaming",
+    "golden goose",
+    "nerd street",
+    "blast spike",
+    "trinity trials",
+    "mystic singularity",
+    "cecc",
+    "collegiate",
+    "saudi eleague",
+    "return of the titans",
+    "nom invitationals",
+    "balkan league",
+)
+
+
 async def _discover_all_event_group_ids(client) -> list:
     """
-    Fetch the VLR.gg stats page and return every event_group_id
-    available in the dropdown (newest first, excludes 'all').
+    Fetch the VLR.gg stats page and return event_group_ids for all
+    major competitive events (skips college/niche/one-off events).
     """
     resp = await fetch_with_retries(f"{VLR_STATS_URL}/", client=client)
     html = HTMLParser(resp.text)
@@ -88,9 +137,19 @@ async def _discover_all_event_group_ids(client) -> list:
     if select:
         for option in select.css("option"):
             val = option.attributes.get("value", "all")
-            if val != "all":
+            if val == "all":
+                continue
+            name_lower = (option.text() or "").strip().lower()
+            # Skip known niche events
+            if any(skip in name_lower for skip in _SKIP_KEYWORDS):
+                continue
+            # Include known major events
+            if any(kw in name_lower for kw in _MAJOR_EVENT_KEYWORDS):
                 ids.append(val)
-    logger.info("Discovered %d event group IDs", len(ids))
+                continue
+            # Include anything else that isn't clearly niche
+            ids.append(val)
+    logger.info("Discovered %d major event group IDs (from dropdown)", len(ids))
     return ids
 
 
