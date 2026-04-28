@@ -15,6 +15,17 @@ logger = logging.getLogger(__name__)
 # Must pair a specific event_group_id with region= to get proper regional data.
 VCT_REGIONS = {"na", "eu", "ap"}
 
+# VLR.gg stats URL uses different region codes than our API keys.
+# "la" (generic Latin America) is not a valid VLR.gg region — split into las+lan.
+VLR_REGION_MAP = {
+    "la-s": "las",
+    "la-n": "lan",
+    "col": "cg",
+}
+
+# Regions that need two requests (las + lan) to cover all of Latin America
+LA_COMBINED = {"la"}
+
 
 def _cell_text(cells: list, index: int) -> str:
     if index >= len(cells):
@@ -167,11 +178,34 @@ async def vlr_stats(region_key: str, timespan: str):
             ]
             rows = vct_rows + extras
 
+        elif region_key in LA_COMBINED:
+            # "la" is not a valid VLR.gg region — fetch las + lan in parallel and merge
+            def _la_url(r):
+                return (
+                    f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
+                    f"&region={r}&country=all&min_rounds=50"
+                    f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
+                )
+            las_rows, lan_rows = await asyncio.gather(
+                _fetch_rows(_la_url("las"), client),
+                _fetch_rows(_la_url("lan"), client),
+            )
+            seen_ids = {r["player_id"] for r in las_rows if r["player_id"]}
+            seen_names = {r["player"] for r in las_rows}
+            extras = [
+                r for r in lan_rows
+                if (r["player_id"] and r["player_id"] not in seen_ids)
+                or (not r["player_id"] and r["player"] not in seen_names)
+            ]
+            rows = las_rows + extras
+
         else:
-            # Smaller / regional circuits (kr, jp, br, la, oce, mn, col, etc.)
+            # Remaining regional circuits (kr, jp, br, la-s, la-n, oce, mn, col, cn)
+            # Map region key to VLR.gg's actual param value where they differ
+            vlr_region = VLR_REGION_MAP.get(region_key, region_key)
             url = (
                 f"{VLR_STATS_URL}/?event_group_id=all&event_id=all"
-                f"&region={region_key}&country=all&min_rounds=200"
+                f"&region={vlr_region}&country=all&min_rounds=50"
                 f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
             )
             rows = await _fetch_rows(url, client)
