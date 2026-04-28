@@ -28,6 +28,15 @@ def _parse_stats_row(item) -> dict:
     if not org:
         org = "N/A"
 
+    player_id = ""
+    if player_cell:
+        player_link = player_cell.css_first("a")
+        if player_link:
+            href = player_link.attributes.get("href", "")
+            parts = href.strip("/").split("/")
+            if len(parts) >= 2 and parts[0] == "player":
+                player_id = parts[1]
+
     agents = []
     for agent_img in item.css("td.mod-agents img"):
         src = agent_img.attributes.get("src", "")
@@ -38,6 +47,7 @@ def _parse_stats_row(item) -> dict:
     return {
         "player": player_name,
         "org": org,
+        "player_id": player_id,
         "agents": agents,
         "rounds_played": _cell_text(cells, 2),
         "rating": _cell_text(cells, 3),
