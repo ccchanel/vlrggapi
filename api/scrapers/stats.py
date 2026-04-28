@@ -82,9 +82,31 @@ def _parse_stats_row(item) -> dict:
     if not org:
         org = "N/A"
 
+    # Try to recover the full team name from any team-logo img alt/title or
+    # team-link slug, falling back to the abbreviation.
+    team_full = ""
+    if player_cell:
+        for img in player_cell.css("img"):
+            alt = (img.attributes.get("alt") or "").strip()
+            title = (img.attributes.get("title") or "").strip()
+            candidate = alt or title
+            if candidate and candidate.lower() not in {"player", "country", "flag"}:
+                team_full = candidate
+                break
+        if not team_full:
+            tlink = player_cell.css_first("a[href*='/team/']")
+            if tlink:
+                href = tlink.attributes.get("href", "")
+                parts = [p for p in href.strip("/").split("/") if p]
+                # /team/<id>/<slug>
+                if len(parts) >= 3 and parts[0] == "team":
+                    slug = parts[2].replace("-", " ").strip()
+                    if slug:
+                        team_full = slug.title()
+
     player_id = ""
     if player_cell:
-        player_link = player_cell.css_first("a")
+        player_link = player_cell.css_first("a[href^='/player/']") or player_cell.css_first("a")
         if player_link:
             href = player_link.attributes.get("href", "")
             parts = href.strip("/").split("/")
@@ -101,6 +123,7 @@ def _parse_stats_row(item) -> dict:
     return {
         "player": player_name,
         "org": org,
+        "team_full": team_full,
         "player_id": player_id,
         "agents": agents,
         "rounds_played": _cell_text(cells, 2),
