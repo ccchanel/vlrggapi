@@ -258,19 +258,15 @@ async def v2_debug_stats_test():
     from utils.constants import VLR_STATS_URL
     client = get_http_client()
     combos = [
-        ("all", "eu", "0"),
-        ("all", "eu", "50"),
-        ("all", "eu", "200"),
-        ("86", "eu", "0"),
-        ("86", "eu", "20"),
-        ("86", "all", "0"),
-        ("85", "eu", "0"),
-        ("85", "all", "0"),
-        ("89", "eu", "0"),
-        ("89", "all", "0"),
-        ("74", "eu", "0"),
-        ("74", "eu", "100"),
-        ("74", "eu", "200"),
+        ("86", "na", "0"),
+        ("86", "ap", "0"),
+        ("86", "kr", "0"),
+        ("85", "na", "0"),
+        ("85", "ap", "0"),
+        ("85", "kr", "0"),
+        ("74", "na", "0"),
+        ("74", "ap", "0"),
+        ("74", "kr", "0"),
     ]
     results = []
     for eid, region, min_rounds in combos:
