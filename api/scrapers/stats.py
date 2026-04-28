@@ -122,7 +122,7 @@ def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
 async def _fetch_rows(url: str, client, semaphore: asyncio.Semaphore) -> list:
     async with semaphore:
         try:
-            resp = await fetch_with_retries(url, client=client)
+            resp = await fetch_with_retries(url, client=client, timeout=8, max_retries=1)
             if resp.status_code != 200:
                 return []
             html = HTMLParser(resp.text)
