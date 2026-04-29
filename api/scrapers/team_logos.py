@@ -66,11 +66,13 @@ def _normalize_logo_url(raw: str) -> str:
 
 
 # Per-team timeout. A single slow VLR proxy request would otherwise pin
-# the whole asyncio.gather() until our 240s build timeout fires, which
-# is what kept producing 502s in production. Capping each /team fetch
-# at 12s means worst case (every team times out) the full batch
-# finishes in ~60/4 * 12 = 180s, comfortably under the build cap.
-_PER_TEAM_TIMEOUT_S = 12
+# the whole asyncio.gather() until our 240s build timeout fires. The
+# initial 12s value succeeded for 31/60 teams in the first NA run —
+# remaining teams (mostly tier-2/VCL orgs) needed an extra retry
+# through the proxy chain that 12s didn't cover. Bumping to 25s with
+# concurrency 4 caps worst-case runtime at 60/4 * 25 = 375s, so we
+# also bump the build hard timeout to 420s.
+_PER_TEAM_TIMEOUT_S = 25
 
 
 async def _fetch_team_safe(team_id: str) -> dict | None:
@@ -106,7 +108,12 @@ async def vlr_team_logos(region_key: str) -> dict:
 
     Cached 6h per region.
     """
-    region_name = validate_region(region_key)
+    # validate_region returns VLR's canonical long form (e.g. 'north-america')
+    # but the frontend keys its Supabase team_logos rows on the SHORT code
+    # (e.g. 'na' from the region selector). Echo the short code back as
+    # the row's region field so the frontend's .eq('region', 'na') filter
+    # actually matches.
+    validate_region(region_key)
 
     async def build():
         # Step 1: rankings → team_id list
@@ -180,7 +187,7 @@ async def vlr_team_logos(region_key: str) -> dict:
                     "team_name": name,
                     "team_tag": tag,
                     "team_logo": logo,
-                    "region": region_name,
+                    "region": region_key,
                 })
 
         return {"data": {"status": 200, "segments": rows}}
@@ -202,7 +209,7 @@ _FAIL_COOLDOWN_S = 60
 # Hard timeout for a full region build. ~120 teams × concurrency 8 → 15
 # batches; each /team/{id} fetch typically completes in 2-5s through
 # the proxy chain. 240s gives ~2x headroom over the realistic worst case.
-_BUILD_HARD_TIMEOUT = 240
+_BUILD_HARD_TIMEOUT = 420
 
 
 def get_cached_team_logos(region_key: str):
