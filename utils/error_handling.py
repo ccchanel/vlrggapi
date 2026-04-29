@@ -17,8 +17,8 @@ from utils.utils import region
 
 logger = logging.getLogger(__name__)
 
-VALID_TIMESPANS = {"30", "60", "90", "all"}
-VALID_PLAYER_TIMESPANS = {"30d", "60d", "90d", "all"}
+VALID_TIMESPANS = {"30", "60", "90", "365"}
+VALID_PLAYER_TIMESPANS = {"30d", "60d", "90d", "365d"}
 VALID_MATCH_QUERIES = {"upcoming", "upcoming_extended", "live_score", "results"}
 VALID_EVENT_QUERIES = {"upcoming", "completed", None}
 

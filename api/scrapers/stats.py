@@ -344,7 +344,11 @@ async def _discover_event_group_ids(client) -> tuple[list, list, list]:
 
 
 def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
-    ts = "all" if timespan.lower() == "all" else f"{timespan}d"
+    # Frontend now passes "30", "60", "90", or "365" — append the
+    # 'd' suffix VLR's URL expects. The legacy "all" value is still
+    # tolerated for cached/stale clients that haven't reloaded yet.
+    ts_lower = (timespan or "").lower()
+    ts = "all" if ts_lower == "all" else f"{timespan}d"
     # min_rating=0 is CRITICAL. VLR's min_rating filter is the
     # opponents'-team-ELO threshold (1550 = only matches where both
     # teams were rated 1550+). For top-tier players whose schedule is
