@@ -184,14 +184,29 @@ def _parse_stats_row(item) -> dict:
     }
 
 
+# Maximum event groups to scrape per region. The dropdown lists
+# years' worth of events; old ones contribute nothing for a 60d
+# timespan because the player didn't compete in them recently
+# anyway. Keeping only the most recent N events drops the per-scrape
+# proxy load from ~80 sub-fetches to ~MAX_EVENT_GROUPS, which is the
+# difference between 'often fails because proxies rate-limit' and
+# 'completes in <60s every time'.
+MAX_EVENT_GROUPS_OPEN = 15
+MAX_EVENT_GROUPS_GC = 10
+
+
 async def _discover_event_group_ids(client) -> tuple[list, list]:
     """
-    Fetch the VLR.gg stats dropdown and return two lists:
-      - open_ids:  event_group_ids for non-GC events
-      - gc_ids:    event_group_ids for Game Changers events
+    Fetch the VLR.gg stats dropdown and return two lists, capped to
+    the most-recent N event groups (highest numeric IDs):
+      - open_ids:  non-GC events
+      - gc_ids:    Game Changers events
+
+    Older events almost never produce any rows under a 60/90-day
+    timespan (the player didn't compete in them recently), so
+    scraping all 80+ historical events just wastes upstream calls
+    and increases the chance one of them rate-limits the whole batch.
     """
-    # Tight timeout — if the dropdown is slow we want to fail fast,
-    # not eat 90 seconds before the actual scrape can start.
     resp = await fetch_with_retries(
         f"{VLR_STATS_URL}/", client=client, timeout=10, max_retries=1
     )
@@ -208,8 +223,19 @@ async def _discover_event_group_ids(client) -> tuple[list, list]:
                 gc_ids.append(val)
             else:
                 open_ids.append(val)
+
+    # Sort by ID descending (newer events have higher IDs since they're
+    # auto-increment) and take the most recent N.
+    def _by_id_desc(ids):
+        try:
+            return sorted(ids, key=lambda x: int(x), reverse=True)
+        except ValueError:
+            return ids
+
+    open_ids = _by_id_desc(open_ids)[:MAX_EVENT_GROUPS_OPEN]
+    gc_ids = _by_id_desc(gc_ids)[:MAX_EVENT_GROUPS_GC]
     logger.info(
-        "Discovered %d open event IDs and %d GC event IDs",
+        "Using %d most-recent open event IDs and %d GC event IDs",
         len(open_ids), len(gc_ids)
     )
     return open_ids, gc_ids
