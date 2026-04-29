@@ -345,10 +345,21 @@ async def _discover_event_group_ids(client) -> tuple[list, list, list]:
 
 def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
     ts = "all" if timespan.lower() == "all" else f"{timespan}d"
+    # min_rating=0 is CRITICAL. VLR's min_rating filter is the
+    # opponents'-team-ELO threshold (1550 = only matches where both
+    # teams were rated 1550+). For top-tier players whose schedule is
+    # entirely against ranked teams it has no effect, but for lower-
+    # tier / VCL / Game Changers / Funhaver players it slices their
+    # season into a tiny sub-sample of their tougher matches —
+    # producing wildly inflated averages from small-sample outliers
+    # (e.g. elul showed rating 1.22 / 266 ACS at min_rating=1550 vs
+    # her real 1.04 / 228 across 408 rounds at min_rating=0). We
+    # always want the full denominator so per-player rating/ACS
+    # match what's on the player's profile page.
     return (
         f"{VLR_STATS_URL}/?event_group_id={event_group_id}&event_id=all"
         f"&region={region}&country=all&min_rounds=0"
-        f"&min_rating=1550&agent=all&map_id=all&timespan={ts}"
+        f"&min_rating=0&agent=all&map_id=all&timespan={ts}"
     )
 
 

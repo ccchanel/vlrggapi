@@ -113,7 +113,7 @@ async def test_vlr_stats_preserves_output_shape_with_structured_row_parsing(monk
     }
     assert client.calls == [
         (
-            "https://www.vlr.gg/stats/?event_group_id=all&event_id=all&region=na&country=all&min_rounds=200&min_rating=1550&agent=all&map_id=all&timespan=30d",
+            "https://www.vlr.gg/stats/?event_group_id=all&event_id=all&region=na&country=all&min_rounds=200&min_rating=0&agent=all&map_id=all&timespan=30d",
             None,
         )
     ]
