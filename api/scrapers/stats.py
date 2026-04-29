@@ -242,16 +242,104 @@ async def _fetch_rows(url: str, client, semaphore: asyncio.Semaphore) -> list:
             return []
 
 
+def _to_float(s: str) -> float:
+    """Parse a number out of a possibly-percentage-suffixed string."""
+    if not s:
+        return 0.0
+    try:
+        return float(str(s).rstrip("%").strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+# Fields that should be weighted by rounds_played when aggregating
+# multiple per-event-group rows for the same player. These are all
+# per-round metrics where summing makes no sense but a rounds-weighted
+# average gives the correct overall.
+_WEIGHTED_FIELDS = (
+    "rating",
+    "average_combat_score",
+    "kill_deaths",
+    "average_damage_per_round",
+    "kills_per_round",
+    "assists_per_round",
+    "first_kills_per_round",
+    "first_deaths_per_round",
+)
+_PERCENT_FIELDS = (
+    "headshot_percentage",
+    "clutch_success_percentage",
+    "kill_assists_survived_traded",
+)
+
+
 def _merge(primary: list, secondary: list) -> list:
-    """Merge two player lists, deduplicating by player_id then name."""
-    seen_ids   = {r["player_id"] for r in primary if r["player_id"]}
-    seen_names = {r["player"]    for r in primary}
-    extras = [
-        r for r in secondary
-        if (r["player_id"] and r["player_id"] not in seen_ids)
-        or (not r["player_id"] and r["player"] not in seen_names)
-    ]
-    return primary + extras
+    """Merge two player lists with rounds-weighted aggregation.
+
+    Each event_group_id we scrape returns per-event stats for the
+    players who competed in it. A player with rows in 5 events should
+    show their TRUE 60-day average, not 'whichever event we hit first'.
+
+    Aggregation rules:
+      - rounds_played: SUM
+      - rating, ACS, K:D, ADR, KPR/APR/FKPR/FDPR: rounds-weighted MEAN
+      - HS%, Clutch%, KAST%: rounds-weighted MEAN of percentages
+      - agents: union (preserves all agents played across events)
+      - org / team_full: keep first non-empty
+    """
+    out = list(primary)
+    by_id = {r["player_id"]: i for i, r in enumerate(out) if r.get("player_id")}
+    by_name = {r["player"]: i for i, r in enumerate(out) if not r.get("player_id")}
+
+    for r in secondary:
+        pid = r.get("player_id")
+        idx = by_id.get(pid) if pid else by_name.get(r.get("player"))
+        if idx is None:
+            out.append(r)
+            if pid:
+                by_id[pid] = len(out) - 1
+            else:
+                by_name[r["player"]] = len(out) - 1
+            continue
+
+        existing = out[idx]
+        old_rounds = _to_float(existing.get("rounds_played"))
+        new_rounds = _to_float(r.get("rounds_played"))
+        total_rounds = old_rounds + new_rounds
+        if total_rounds <= 0:
+            continue
+
+        # Rounds-weighted mean for per-round metrics
+        for f in _WEIGHTED_FIELDS:
+            old_v = _to_float(existing.get(f))
+            new_v = _to_float(r.get(f))
+            avg = (old_v * old_rounds + new_v * new_rounds) / total_rounds
+            existing[f] = f"{avg:.2f}"
+
+        # Rounds-weighted mean for percentage metrics
+        for f in _PERCENT_FIELDS:
+            old_v = _to_float(existing.get(f))
+            new_v = _to_float(r.get(f))
+            avg = (old_v * old_rounds + new_v * new_rounds) / total_rounds
+            # Preserve trailing % only if the inputs had it
+            had_pct = "%" in str(existing.get(f) or "") or "%" in str(r.get(f) or "")
+            existing[f] = f"{round(avg)}%" if had_pct else f"{avg:.2f}"
+
+        existing["rounds_played"] = str(int(total_rounds))
+
+        # Union of agents played across events
+        agents_old = existing.get("agents") or []
+        agents_new = r.get("agents") or []
+        if agents_new:
+            existing["agents"] = list(dict.fromkeys(list(agents_old) + list(agents_new)))
+
+        # Keep first non-empty for cosmetic fields
+        for f in ("org", "team_full"):
+            if not existing.get(f) or existing.get(f) in {"", "N/A"}:
+                if r.get(f) and r.get(f) not in {"", "N/A"}:
+                    existing[f] = r[f]
+
+    return out
 
 
 async def _fetch_all_for_region(region: str, timespan: str, ids: list, client) -> list:
