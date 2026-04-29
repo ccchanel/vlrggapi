@@ -63,6 +63,13 @@ async def _background_build(region_key: str, timespan: str):
             logger.info("Background stats build complete: %s (%d players)", key, len(segments))
     except asyncio.TimeoutError:
         logger.error("Background stats build TIMED OUT after %ds: %s", _BUILD_HARD_TIMEOUT, key)
+        # Kill the inflight task — wait_for cancelling US doesn't kill
+        # the underlying coalesced producer; we have to cancel it ourselves
+        # or new requests will coalesce into the zombie task forever.
+        try:
+            cache_manager.invalidate(CACHE_TTL_STATS, "stats", region_key, timespan)
+        except Exception:
+            pass
         _failed_builds[key] = time.time()
     except Exception as exc:
         logger.error("Background stats build failed for %s: %s", key, exc)

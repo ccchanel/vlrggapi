@@ -101,10 +101,22 @@ class CacheManager:
         return await self.coalesce_async(key, build)
 
     def invalidate(self, ttl: int, *args, **kwargs):
-        """Remove a specific entry."""
+        """Remove a specific entry AND cancel any in-flight build for it.
+
+        Cancelling the inflight task is important: without it, a
+        force-refresh would invalidate the cached value but new
+        requests would still coalesce into the same forever-running
+        task that would never write a fresh value. Caller code that
+        kicks off a fresh background build after invalidate() now
+        actually gets a fresh task instead of awaiting a zombie.
+        """
         cache = self._get_cache(ttl)
         key = self.make_cache_key(*args, **kwargs)
         cache.pop(key, None)
+        inflight_key = f"{ttl}:{key}"
+        inflight = self._inflight.pop(inflight_key, None)
+        if inflight is not None and not inflight.done():
+            inflight.cancel()
 
     def clear_all(self):
         """Clear all caches."""
