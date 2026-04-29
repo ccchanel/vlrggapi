@@ -65,10 +65,27 @@ def _normalize_logo_url(raw: str) -> str:
     return raw
 
 
+# Per-team timeout. A single slow VLR proxy request would otherwise pin
+# the whole asyncio.gather() until our 240s build timeout fires, which
+# is what kept producing 502s in production. Capping each /team fetch
+# at 12s means worst case (every team times out) the full batch
+# finishes in ~60/4 * 12 = 180s, comfortably under the build cap.
+_PER_TEAM_TIMEOUT_S = 12
+
+
 async def _fetch_team_safe(team_id: str) -> dict | None:
-    """Wrap vlr_team in try/except so one failure doesn't kill the batch."""
+    """Wrap vlr_team in try/except + timeout so one failure doesn't kill the batch."""
     try:
-        result = await vlr_team(team_id)
+        result = await asyncio.wait_for(
+            vlr_team(team_id),
+            timeout=_PER_TEAM_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "team_logos: vlr_team(%s) timed out after %ds",
+            team_id, _PER_TEAM_TIMEOUT_S,
+        )
+        return None
     except Exception as exc:
         logger.warning("team_logos: vlr_team(%s) failed: %s", team_id, exc)
         return None
