@@ -23,6 +23,12 @@ from routers.shared_handlers import (
     get_team_transactions_data,
 )
 from api.scrapers.stats import get_cached_stats, is_building, recently_failed, start_background_build
+from api.scrapers.team_logos import (
+    get_cached_team_logos,
+    is_building_team_logos,
+    recently_failed_team_logos,
+    start_background_team_logos_build,
+)
 from api.scrapers.player_resilient import (
     get_cached_player,
     get_cached_player_matches,
@@ -403,6 +409,44 @@ async def v2_event_matches(
     validate_id_param(event_id, "event_id")
     result = await get_event_matches_data(event_id)
     return _wrap_v2(result)
+
+
+@router.get("/team_logos")
+@limiter.limit(RATE_LIMIT)
+async def v2_team_logos(
+    request: Request,
+    region: str = Query(..., description="Region shortname (na, eu, ap, la, etc.)"),
+):
+    """
+    Bulk team-logo lookup for a region.
+
+    Returns a flat list of {player_id, team_id, team_name, team_tag,
+    team_logo, region} rows covering every player on a top-N ranked
+    team. The frontend uses this so stats rows show a logo INSTANTLY
+    without waiting for individual /v2/player profile fetches.
+
+    Pattern: 200 with data when cached, 202 {status:"building"} while
+    the rankings + per-team fan-out runs (~30-90s on cold cache).
+    """
+    validate_region(region)
+
+    cached = get_cached_team_logos(region)
+    if cached is not None:
+        return _wrap_v2(cached)
+
+    if recently_failed_team_logos(region):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Recent team-logo build for region '{region}' failed. "
+                f"Try again in ~1 minute."
+            ),
+        )
+
+    if not is_building_team_logos(region):
+        start_background_team_logos_build(region)
+
+    return JSONResponse({"status": "building"}, status_code=202)
 
 
 @router.get("/health", response_model=V2Response)

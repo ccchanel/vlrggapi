@@ -117,6 +117,13 @@ async def vlr_rankings(region_key):
             team_logo = team_link.css_first("img") if team_link else None
             logo = team_logo.attributes.get("src", "") if team_logo else ""
             logo = re.sub(r"/img/vlr/tmp/vlr.png", "", logo)
+            # team_id from /team/{id}/{slug}
+            team_id = ""
+            if team_link:
+                href = team_link.attributes.get("href", "") or ""
+                m = re.search(r"/team/(\d+)", href)
+                if m:
+                    team_id = m.group(1)
             country = _normalize_text(item.css_first("div.rank-item-team-country").text())
             last_played, last_played_team, last_played_team_logo = _extract_last_played_summary(item)
             record = _normalize_text(item.css_first("div.rank-item-record").text())
@@ -126,6 +133,7 @@ async def vlr_rankings(region_key):
                 {
                     "rank": rank,
                     "team": team,
+                    "team_id": team_id,
                     "country": country,
                     "last_played": last_played,
                     "last_played_team": last_played_team,
