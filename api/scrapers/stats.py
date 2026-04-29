@@ -33,6 +33,11 @@ def recently_failed(region_key: str, timespan: str) -> bool:
     ts = _failed_builds.get(key)
     return bool(ts and (time.time() - ts) < _FAILURE_BACKOFF)
 
+# Major regions where 0 players returned almost certainly means the scrape
+# failed silently (empty cache poisoning) rather than a legitimate "no data".
+# For these, an empty result is treated as a failure and NOT cached.
+_MAJOR_REGIONS = {"na", "eu", "ap", "kr", "br", "cn", "jp"}
+
 async def _background_build(region_key: str, timespan: str):
     key = _job_key(region_key, timespan)
     try:
@@ -42,12 +47,20 @@ async def _background_build(region_key: str, timespan: str):
             timeout=_BUILD_HARD_TIMEOUT,
         )
         segments = (result or {}).get("data", {}).get("segments", [])
-        # Empty results are LEGITIMATE (e.g. GC has no recent tournaments,
-        # niche timespan with no matches) — they're cached and the frontend
-        # will surface them as "no players found". Only real exceptions
-        # / timeouts count as failures.
-        _failed_builds.pop(key, None)
-        logger.info("Background stats build complete: %s (%d players)", key, len(segments))
+        # For MAJOR regions, 0 players is almost certainly a failure
+        # (network blip, all sub-fetches timed out, etc). Don't let that
+        # poison the cache for 4 hours. Force-invalidate and mark failed.
+        if not segments and region_key in _MAJOR_REGIONS:
+            logger.warning("Major region %s returned 0 players — invalidating cache", key)
+            try:
+                cache_manager.invalidate(CACHE_TTL_STATS, "stats", region_key, timespan)
+            except Exception:
+                pass
+            _failed_builds[key] = time.time()
+        else:
+            # Empty results from niche regions (gc, la-n, la-s) ARE legitimate
+            _failed_builds.pop(key, None)
+            logger.info("Background stats build complete: %s (%d players)", key, len(segments))
     except asyncio.TimeoutError:
         logger.error("Background stats build TIMED OUT after %ds: %s", _BUILD_HARD_TIMEOUT, key)
         _failed_builds[key] = time.time()

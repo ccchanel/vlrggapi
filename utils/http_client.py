@@ -24,8 +24,9 @@ _client: httpx.AsyncClient | None = None
 _client_created_at: float = 0.0
 # After this many seconds, the next get_http_client() call recycles the
 # pool — even if it's still functional. Cheap insurance against zombie
-# keepalive connections building up.
-_CLIENT_TTL = 600  # 10 minutes
+# keepalive connections building up. Aggressive (4 min) because Railway
+# egress to VLR.gg has been observed to silently degrade over time.
+_CLIENT_TTL = 240  # 4 minutes
 
 
 def _build_client() -> httpx.AsyncClient:

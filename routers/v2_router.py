@@ -23,6 +23,16 @@ from routers.shared_handlers import (
     get_team_transactions_data,
 )
 from api.scrapers.stats import get_cached_stats, is_building, recently_failed, start_background_build
+from api.scrapers.player_resilient import (
+    get_cached_player,
+    get_cached_player_matches,
+    is_building_player,
+    is_building_matches,
+    recently_failed_player,
+    recently_failed_matches,
+    start_persistent_player_fetch,
+    start_persistent_matches_fetch,
+)
 from utils.constants import RATE_LIMIT, MAX_MATCH_QUERY_BOUND
 from utils.error_handling import (
     validate_event_query,
@@ -195,7 +205,35 @@ async def v2_match_detail(
     return _wrap_v2(result)
 
 
-@router.get("/player", response_model=V2Response)
+@router.get("/health/upstream")
+async def v2_health_upstream(request: Request):
+    """Probe VLR.gg from this server. Useful for the frontend to detect
+    egress issues and show a 'connection degraded' indicator."""
+    import time as _t
+    import httpx as _httpx
+    from utils.utils import headers as _headers
+    started = _t.time()
+    status = "ok"
+    upstream_status = None
+    error = None
+    try:
+        async with _httpx.AsyncClient(headers=_headers, timeout=_httpx.Timeout(6), follow_redirects=True) as cli:
+            r = await cli.get("https://www.vlr.gg/")
+            upstream_status = r.status_code
+            if r.status_code >= 500:
+                status = "degraded"
+    except Exception as exc:
+        status = "down"
+        error = str(exc)
+    return {
+        "status": status,
+        "upstream_status": upstream_status,
+        "elapsed_ms": int((_t.time() - started) * 1000),
+        "error": error,
+    }
+
+
+@router.get("/player")
 @limiter.limit(RATE_LIMIT)
 async def v2_player(
     request: Request,
@@ -203,27 +241,56 @@ async def v2_player(
     timespan: str = Query("90d", description="Stats timespan: 30d, 60d, 90d, or all"),
 ):
     """
-    Get player profile.
+    Resilient player profile with 202/poll fallback.
 
-    Includes agent stats, current/past teams, event placements, news, and total winnings.
+    Returns 200 with data when cached. On cache miss, returns 202
+    {status: "building"} and spawns a persistent background worker
+    that retries the upstream fetch every few seconds for up to
+    ~90s. Frontend polls until 200.
     """
     validate_id_param(id)
     validate_player_timespan(timespan)
-    result = await get_player_data(id, timespan)
-    return _wrap_v2(result)
+
+    cached = get_cached_player(id, timespan)
+    if cached is not None:
+        return _wrap_v2(cached)
+
+    if recently_failed_player(id, timespan):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Recent attempts to fetch player {id} failed. Try again in ~1 minute.",
+        )
+
+    if not is_building_player(id, timespan):
+        start_persistent_player_fetch(id, timespan)
+
+    return JSONResponse({"status": "building"}, status_code=202)
 
 
-@router.get("/player/matches", response_model=V2Response)
+@router.get("/player/matches")
 @limiter.limit(RATE_LIMIT)
 async def v2_player_matches(
     request: Request,
     id: str = Query(..., description="VLR.GG player ID"),
     page: int = Query(1, description="Page number (1-based)", ge=1, le=100),
 ):
-    """Get paginated match history for a player."""
+    """Resilient match history with 202/poll fallback (same pattern as /player)."""
     validate_id_param(id)
-    result = await get_player_matches_data(id, page)
-    return _wrap_v2(result)
+
+    cached = get_cached_player_matches(id, page)
+    if cached is not None:
+        return _wrap_v2(cached)
+
+    if recently_failed_matches(id, page):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Recent attempts to fetch matches for player {id} failed. Try again in ~1 minute.",
+        )
+
+    if not is_building_matches(id, page):
+        start_persistent_matches_fetch(id, page)
+
+    return JSONResponse({"status": "building"}, status_code=202)
 
 
 @router.get("/team", response_model=V2Response)
