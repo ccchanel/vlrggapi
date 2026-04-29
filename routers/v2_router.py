@@ -222,29 +222,64 @@ async def v2_match_detail(
 
 @router.get("/health/upstream")
 async def v2_health_upstream(request: Request):
-    """Probe VLR.gg from this server. Useful for the frontend to detect
-    egress issues and show a 'connection degraded' indicator."""
+    """Probe VLR.gg from this server. Reports on BOTH the direct path
+    (Railway → vlr.gg) and the proxy path (Railway → Cloudflare Worker
+    → vlr.gg). The proxy is what the actual scrapers fall through to
+    when direct is blocked, so as long as it works the user sees data
+    and the frontend should show 'ok'.
+
+    Status semantics:
+      ok       — proxy path works (frontend has real data)
+      degraded — direct fails but proxy works (still ok for users)
+      down     — neither path works
+    """
     import time as _t
     import httpx as _httpx
+    import urllib.parse as _urlp
     from utils.utils import headers as _headers
     started = _t.time()
-    status = "ok"
-    upstream_status = None
-    error = None
-    try:
-        async with _httpx.AsyncClient(headers=_headers, timeout=_httpx.Timeout(6), follow_redirects=True) as cli:
+
+    direct_status = None
+    direct_error = None
+    proxy_status = None
+    proxy_error = None
+
+    timeout = _httpx.Timeout(6)
+    async with _httpx.AsyncClient(headers=_headers, timeout=timeout, follow_redirects=True) as cli:
+        # Direct path
+        try:
             r = await cli.get("https://www.vlr.gg/")
-            upstream_status = r.status_code
-            if r.status_code >= 500:
-                status = "degraded"
-    except Exception as exc:
+            direct_status = r.status_code
+        except Exception as exc:
+            direct_error = str(exc) or type(exc).__name__
+
+        # Proxy path — same path the actual scrapers use when direct fails
+        proxy_url = (
+            "https://vlrgg-proxy.emirerdem2.workers.dev/?url="
+            + _urlp.quote("https://www.vlr.gg/", safe="")
+        )
+        try:
+            r = await cli.get(proxy_url)
+            proxy_status = r.status_code
+        except Exception as exc:
+            proxy_error = str(exc) or type(exc).__name__
+
+    # Aggregate verdict
+    direct_ok = direct_status is not None and direct_status < 500
+    proxy_ok = proxy_status is not None and proxy_status < 500
+    if proxy_ok:
+        status = "ok" if direct_ok else "degraded"
+    else:
         status = "down"
-        error = str(exc)
+
     return {
         "status": status,
-        "upstream_status": upstream_status,
+        "upstream_status": direct_status,  # legacy field — kept for compat
+        "direct_status": direct_status,
+        "direct_error": direct_error,
+        "proxy_status": proxy_status,
+        "proxy_error": proxy_error,
         "elapsed_ms": int((_t.time() - started) * 1000),
-        "error": error,
     }
 
 
