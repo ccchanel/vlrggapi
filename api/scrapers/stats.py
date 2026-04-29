@@ -126,6 +126,18 @@ def _is_gc_event(name: str) -> bool:
     return "gamechangers" in flat
 
 
+def _is_funhaver_event(name: str) -> bool:
+    """MrFunhaver-branded NA tournament series. These often have older
+    event_group_ids than the latest VCT/VCL/Ascension events, so they
+    get cut off by the top-N cap in discovery — even though they're
+    still actively producing recent matches in our timespan window.
+    Detect them so we can pin them in alongside the top-N."""
+    if not name:
+        return False
+    n = name.lower()
+    return "funhaver" in n or "fun haver" in n or "mrfunhaver" in n
+
+
 def _cell_text(cells: list, index: int) -> str:
     if index >= len(cells):
         return ""
@@ -249,16 +261,19 @@ def _classify_event_tier(name: str, region_key: str) -> float:
     return TIER_OTHER
 
 
-async def _discover_event_group_ids(client) -> tuple[list, list]:
+async def _discover_event_group_ids(client) -> tuple[list, list, list]:
     """
-    Fetch the VLR.gg stats dropdown and return two lists of (id, name)
+    Fetch the VLR.gg stats dropdown and return three lists of (id, name)
     tuples, capped to the most-recent N events (highest numeric IDs):
-      - open_ids:  non-GC events (with names so callers can classify tier)
-      - gc_ids:    Game Changers events
+      - open_ids:     non-GC, non-Funhaver events
+      - gc_ids:       Game Changers events
+      - funhaver_ids: MrFunhaver tournament series (NA T2 circuit)
 
     Older events almost never produce any rows under a 60/90-day
     timespan, so scraping the full ~80 wastes upstream calls and
-    increases proxy rate-limit risk.
+    increases proxy rate-limit risk. Funhaver gets its own bucket so
+    we can always include it for NA even when its event_group_id is
+    older than the top-25 cutoff.
     """
     resp = await fetch_with_retries(
         f"{VLR_STATS_URL}/", client=client, timeout=10, max_retries=1
@@ -267,6 +282,7 @@ async def _discover_event_group_ids(client) -> tuple[list, list]:
     select = html.css_first("select[name='event_group_id']")
     open_pairs: list[tuple[str, str]] = []
     gc_pairs: list[tuple[str, str]] = []
+    funhaver_pairs: list[tuple[str, str]] = []
     if select:
         for option in select.css("option"):
             val = option.attributes.get("value", "all")
@@ -275,6 +291,8 @@ async def _discover_event_group_ids(client) -> tuple[list, list]:
             name = (option.text() or "").strip()
             if _is_gc_event(name):
                 gc_pairs.append((val, name))
+            elif _is_funhaver_event(name):
+                funhaver_pairs.append((val, name))
             else:
                 open_pairs.append((val, name))
 
@@ -286,11 +304,14 @@ async def _discover_event_group_ids(client) -> tuple[list, list]:
 
     open_pairs = _by_id_desc(open_pairs)[:MAX_EVENT_GROUPS_OPEN]
     gc_pairs = _by_id_desc(gc_pairs)[:MAX_EVENT_GROUPS_GC]
+    # Funhaver: keep all of them — there are typically only 1-3 active
+    # series, and missing one means missing players like Zanks.
+    funhaver_pairs = _by_id_desc(funhaver_pairs)
     logger.info(
-        "Using %d most-recent open event groups and %d GC event groups",
-        len(open_pairs), len(gc_pairs)
+        "Using %d open, %d GC, and %d Funhaver event groups",
+        len(open_pairs), len(gc_pairs), len(funhaver_pairs)
     )
-    return open_pairs, gc_pairs
+    return open_pairs, gc_pairs, funhaver_pairs
 
 
 def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
@@ -499,13 +520,13 @@ async def _fetch_all_for_region(
     return merged
 
 
-async def _safe_discover(client) -> tuple[list, list]:
+async def _safe_discover(client) -> tuple[list, list, list]:
     """Discover event group IDs; on failure, return empty lists rather than raising."""
     try:
         return await _discover_event_group_ids(client)
     except Exception as exc:
         logger.warning("Event-group discovery failed (continuing with fallback): %s", exc)
-        return [], []
+        return [], [], []
 
 
 async def _fetch_single_all(region: str, timespan: str, client) -> list:
@@ -524,7 +545,15 @@ async def vlr_stats(region_key: str, timespan: str):
         validate_timespan(timespan)
 
         client = get_http_client()
-        open_ids, gc_ids = await _safe_discover(client)
+        open_ids, gc_ids, funhaver_ids = await _safe_discover(client)
+
+        # NA gets MrFunhaver pinned in alongside the top-N open events
+        # — those events frequently have older event_group_ids that
+        # would otherwise be cut by the cap, missing T2 NA players
+        # like Zanks who only show up there. Other regions ignore
+        # Funhaver entirely (per _classify_event_tier policy).
+        if region_key == "na" and funhaver_ids:
+            open_ids = list(open_ids) + list(funhaver_ids)
 
         if region_key == "gc":
             rows = await _fetch_all_for_region("gc", timespan, gc_ids, client, region_key="gc") if gc_ids else []
