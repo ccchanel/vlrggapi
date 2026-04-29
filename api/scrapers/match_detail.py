@@ -701,7 +701,13 @@ async def vlr_match_detail(match_id: str) -> dict:
 
         client = get_http_client()
 
-        base_resp = await fetch_with_retries(base_url, client=client)
+        # Base page is REQUIRED — contains the per-map player stats
+        # tables that the frontend actually displays. Use a tight
+        # timeout (10s, single attempt) so a slow upstream / proxy
+        # fails fast and the persistent worker can retry.
+        base_resp = await fetch_with_retries(
+            base_url, client=client, timeout=10, max_retries=1
+        )
         base_html = HTMLParser(base_resp.text)
         http_status = base_resp.status_code
 
@@ -711,25 +717,41 @@ async def vlr_match_detail(match_id: str) -> dict:
         performance_by_game: dict[str, dict] = {}
         economy_by_game: dict[str, list[dict]] = {}
 
+        # Performance + economy tabs are EXTRAS — frontend doesn't
+        # use them today. Wrap the whole gather in a short timeout
+        # so a slow tab can't block the entire match-detail response.
+        # If they fail, performance_by_game/economy_by_game stay empty.
         if game_ids:
-            tab_results = await asyncio.gather(
-                *[
-                    _fetch_game_tab_html(client, base_url, game_id, tab)
-                    for game_id in game_ids
-                    for tab in ("performance", "economy")
-                ]
-            )
-
-            for game_id, tab, tab_html in tab_results:
-                if tab_html is None:
-                    continue
-                if tab == "performance":
-                    performance_by_game[game_id] = {
-                        "kill_matrix": _parse_kill_matrix(tab_html),
-                        "advanced_stats": _parse_advanced_stats(tab_html),
-                    }
-                elif tab == "economy":
-                    economy_by_game[game_id] = _parse_economy(tab_html)
+            try:
+                tab_results = await asyncio.wait_for(
+                    asyncio.gather(
+                        *[
+                            _fetch_game_tab_html(client, base_url, game_id, tab)
+                            for game_id in game_ids
+                            for tab in ("performance", "economy")
+                        ],
+                        return_exceptions=True,
+                    ),
+                    timeout=12,
+                )
+                for item in tab_results:
+                    if isinstance(item, Exception) or item is None:
+                        continue
+                    game_id, tab, tab_html = item
+                    if tab_html is None:
+                        continue
+                    if tab == "performance":
+                        performance_by_game[game_id] = {
+                            "kill_matrix": _parse_kill_matrix(tab_html),
+                            "advanced_stats": _parse_advanced_stats(tab_html),
+                        }
+                    elif tab == "economy":
+                        economy_by_game[game_id] = _parse_economy(tab_html)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Match %s: performance/economy tabs timed out after 12s — "
+                    "returning core data without them.", match_id,
+                )
 
         event_info = _parse_event_info(base_html)
         header_info = _parse_match_header(base_html)
