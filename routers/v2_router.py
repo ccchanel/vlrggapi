@@ -82,29 +82,38 @@ async def v2_stats(
     region: str = Query(..., description="Region shortname (na, eu, ap, la, etc.)"),
     timespan: str = Query(..., description="Timespan: 30, 60, 90, or all"),
     force: bool = Query(False, description="Force a fresh scrape, ignoring cache"),
+    exclude_funhaver: bool = Query(False, description="(NA only) skip MrFunhaver event groups"),
 ):
     """
     Get player statistics for a region and timespan.
     Returns 200 with data when cached, or 202 {"status":"building"} while scraping.
     Poll the same endpoint every few seconds until you get 200.
+
+    Set ?exclude_funhaver=1 (NA only) to drop MrFunhaver tournament data
+    from the aggregation — useful when you want strictly VCT/VCL/Open
+    Challengers stats without the T2 community circuit mixed in.
     """
     # Validate params eagerly so bad input still gets 400
     validate_region(region)
     validate_timespan(timespan)
 
+    # exclude_funhaver only meaningful for NA — silently no-op elsewhere
+    excl = bool(exclude_funhaver) and region == "na"
+
     # Force refresh: invalidate cache then fall through to build
     if force:
         from utils.constants import CACHE_TTL_STATS
         from utils.cache_manager import cache_manager
-        cache_manager.invalidate(CACHE_TTL_STATS, "stats", region, timespan)
+        from api.scrapers.stats import _cache_args
+        cache_manager.invalidate(CACHE_TTL_STATS, *_cache_args(region, timespan, excl))
     else:
         # Cache hit → immediate response
-        cached = get_cached_stats(region, timespan)
+        cached = get_cached_stats(region, timespan, excl)
         if cached is not None:
             return _wrap_v2(cached)
 
     # Recent build failed → return error so client stops polling
-    if recently_failed(region, timespan):
+    if recently_failed(region, timespan, excl):
         raise HTTPException(
             status_code=502,
             detail=(
@@ -115,11 +124,11 @@ async def v2_stats(
         )
 
     # Already building → tell client to poll
-    if is_building(region, timespan):
+    if is_building(region, timespan, excl):
         return JSONResponse({"status": "building"}, status_code=202)
 
     # Cold cache → fire background scrape, tell client to poll
-    start_background_build(region, timespan)
+    start_background_build(region, timespan, excl)
     return JSONResponse({"status": "building"}, status_code=202)
 
 

@@ -18,20 +18,25 @@ _BUILD_HARD_TIMEOUT = 240  # seconds — 25 event groups × up to 3 retries
                             # each, semaphore=8 → worst case ~10 batches
                             # × ~12s = 120s. 240s gives 2× headroom.
 
-def _job_key(region_key: str, timespan: str) -> str:
-    return f"stats:{region_key}:{timespan}"
+def _job_key(region_key: str, timespan: str, exclude_funhaver: bool = False) -> str:
+    suffix = ":nofun" if exclude_funhaver else ""
+    return f"stats:{region_key}:{timespan}{suffix}"
 
-def get_cached_stats(region_key: str, timespan: str):
+def _cache_args(region_key: str, timespan: str, exclude_funhaver: bool = False):
+    base = ("stats", region_key, timespan)
+    return base + ("nofun",) if exclude_funhaver else base
+
+def get_cached_stats(region_key: str, timespan: str, exclude_funhaver: bool = False):
     """Return cached stats payload or None."""
-    return cache_manager.get(CACHE_TTL_STATS, "stats", region_key, timespan)
+    return cache_manager.get(CACHE_TTL_STATS, *_cache_args(region_key, timespan, exclude_funhaver))
 
-def is_building(region_key: str, timespan: str) -> bool:
+def is_building(region_key: str, timespan: str, exclude_funhaver: bool = False) -> bool:
     """Return True if a background scrape is in progress."""
-    return _job_key(region_key, timespan) in _building
+    return _job_key(region_key, timespan, exclude_funhaver) in _building
 
-def recently_failed(region_key: str, timespan: str) -> bool:
+def recently_failed(region_key: str, timespan: str, exclude_funhaver: bool = False) -> bool:
     """Return True if a recent build failed (within backoff window)."""
-    key = _job_key(region_key, timespan)
+    key = _job_key(region_key, timespan, exclude_funhaver)
     ts = _failed_builds.get(key)
     return bool(ts and (time.time() - ts) < _FAILURE_BACKOFF)
 
@@ -40,36 +45,31 @@ def recently_failed(region_key: str, timespan: str) -> bool:
 # For these, an empty result is treated as a failure and NOT cached.
 _MAJOR_REGIONS = {"na", "eu", "ap", "kr", "br", "cn", "jp"}
 
-async def _background_build(region_key: str, timespan: str):
-    key = _job_key(region_key, timespan)
+async def _background_build(region_key: str, timespan: str, exclude_funhaver: bool = False):
+    key = _job_key(region_key, timespan, exclude_funhaver)
+    cargs = _cache_args(region_key, timespan, exclude_funhaver)
     try:
         # Hard timeout so a single bad scrape can't hang for minutes
         result = await asyncio.wait_for(
-            vlr_stats(region_key, timespan),
+            vlr_stats(region_key, timespan, exclude_funhaver=exclude_funhaver),
             timeout=_BUILD_HARD_TIMEOUT,
         )
         segments = (result or {}).get("data", {}).get("segments", [])
         # For MAJOR regions, 0 players is almost certainly a failure
-        # (network blip, all sub-fetches timed out, etc). Don't let that
-        # poison the cache for 4 hours. Force-invalidate and mark failed.
         if not segments and region_key in _MAJOR_REGIONS:
             logger.warning("Major region %s returned 0 players — invalidating cache", key)
             try:
-                cache_manager.invalidate(CACHE_TTL_STATS, "stats", region_key, timespan)
+                cache_manager.invalidate(CACHE_TTL_STATS, *cargs)
             except Exception:
                 pass
             _failed_builds[key] = time.time()
         else:
-            # Empty results from niche regions (gc, la-n, la-s) ARE legitimate
             _failed_builds.pop(key, None)
             logger.info("Background stats build complete: %s (%d players)", key, len(segments))
     except asyncio.TimeoutError:
         logger.error("Background stats build TIMED OUT after %ds: %s", _BUILD_HARD_TIMEOUT, key)
-        # Kill the inflight task — wait_for cancelling US doesn't kill
-        # the underlying coalesced producer; we have to cancel it ourselves
-        # or new requests will coalesce into the zombie task forever.
         try:
-            cache_manager.invalidate(CACHE_TTL_STATS, "stats", region_key, timespan)
+            cache_manager.invalidate(CACHE_TTL_STATS, *cargs)
         except Exception:
             pass
         _failed_builds[key] = time.time()
@@ -79,13 +79,13 @@ async def _background_build(region_key: str, timespan: str):
     finally:
         _building.discard(key)
 
-def start_background_build(region_key: str, timespan: str) -> bool:
+def start_background_build(region_key: str, timespan: str, exclude_funhaver: bool = False) -> bool:
     """Fire a background scrape task. Returns False if one is already running."""
-    key = _job_key(region_key, timespan)
+    key = _job_key(region_key, timespan, exclude_funhaver)
     if key in _building:
         return False
     _building.add(key)
-    asyncio.create_task(_background_build(region_key, timespan))
+    asyncio.create_task(_background_build(region_key, timespan, exclude_funhaver))
     logger.info("Background stats build started: %s", key)
     return True
 # ─────────────────────────────────────────────────────────────────────────────
@@ -608,7 +608,7 @@ async def _fetch_single_all(region: str, timespan: str, client) -> list:
 
 
 @handle_scraper_errors
-async def vlr_stats(region_key: str, timespan: str):
+async def vlr_stats(region_key: str, timespan: str, exclude_funhaver: bool = False):
     async def build():
         validate_region(region_key)
         validate_timespan(timespan)
@@ -621,7 +621,10 @@ async def vlr_stats(region_key: str, timespan: str):
         # would otherwise be cut by the cap, missing T2 NA players
         # like Zanks who only show up there. Other regions ignore
         # Funhaver entirely (per _classify_event_tier policy).
-        if region_key == "na" and funhaver_ids:
+        # When the caller explicitly opts out via ?exclude_funhaver=1,
+        # we skip pinning the Funhaver event groups so the response
+        # contains only ranked / VCT / VCL data.
+        if region_key == "na" and funhaver_ids and not exclude_funhaver:
             open_ids = list(open_ids) + list(funhaver_ids)
 
         if region_key == "gc":
@@ -656,6 +659,11 @@ async def vlr_stats(region_key: str, timespan: str):
         logger.info("vlr_stats(%s, %s): %d players", region_key, timespan, len(rows))
         return {"data": {"status": 200, "segments": rows}}
 
+    # Cache key includes the exclude_funhaver flag so the two
+    # variants don't collide.
+    cache_args = ("stats", region_key, timespan)
+    if exclude_funhaver:
+        cache_args = cache_args + ("nofun",)
     return await cache_manager.get_or_create_async(
-        CACHE_TTL_STATS, build, "stats", region_key, timespan
+        CACHE_TTL_STATS, build, *cache_args
     )
