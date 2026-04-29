@@ -236,6 +236,86 @@ def _parse_agent_stats(html: HTMLParser) -> list[dict]:
     return agent_stats
 
 
+def _parse_map_stats(html: HTMLParser) -> list[dict]:
+    """
+    Extract per-map statistics. VLR.gg player profiles have multiple
+    `table.wf-table` blocks; the map table is the one whose first-column
+    images are sourced from `/img/vlr/game/maps/`.
+
+    Same column layout as agent stats (17 columns).
+    """
+    map_stats: list[dict] = []
+
+    for table in html.css("table.wf-table"):
+        # Sniff the first body row to decide whether this is the map table
+        first_row = table.css_first("tbody tr")
+        if not first_row:
+            continue
+        first_cells = first_row.css("td")
+        if not first_cells:
+            continue
+        first_img = first_cells[0].css_first("img")
+        first_src = (first_img.attributes.get("src", "") if first_img else "") or ""
+        # Skip the agents table; only process the maps one
+        if "/maps/" not in first_src:
+            continue
+
+        for row in table.css("tbody tr"):
+            cells = row.css("td")
+            if len(cells) < 17:
+                continue
+
+            # Map name — try img alt/title, then text
+            map_name = ""
+            img = cells[0].css_first("img")
+            if img:
+                map_name = img.attributes.get("alt", "") or img.attributes.get("title", "")
+            if not map_name:
+                map_name = cells[0].text(strip=True)
+            if not map_name:
+                continue
+
+            # Use column — count + percentage
+            use_text = cells[1].text(strip=True)
+            usage_count = ""
+            usage_pct = ""
+            count_match = re.search(r"\((\d+)\)", use_text)
+            if count_match:
+                usage_count = count_match.group(1)
+            pct_match = re.search(r"(\d+%)", use_text)
+            if pct_match:
+                usage_pct = pct_match.group(1)
+
+            def val(idx: int) -> str:
+                return cells[idx].text(strip=True) if idx < len(cells) else ""
+
+            map_stats.append({
+                "map": map_name,
+                "usage_count": usage_count,
+                "usage_pct": usage_pct,
+                "rounds": val(2),
+                "rating": val(3),
+                "acs": val(4),
+                "kd": val(5),
+                "adr": val(6),
+                "kast": val(7),
+                "kpr": val(8),
+                "apr": val(9),
+                "fkpr": val(10),
+                "fdpr": val(11),
+                "kills": val(12),
+                "deaths": val(13),
+                "assists": val(14),
+                "fk": val(15),
+                "fd": val(16),
+            })
+
+        # Found the map table; no need to keep scanning
+        break
+
+    return map_stats
+
+
 def _parse_event_placements(html: HTMLParser) -> list[dict]:
     """
     Extract tournament placement records.
@@ -483,6 +563,7 @@ async def vlr_player(player_id: str, timespan: str = "90d") -> dict:
         player_info = _parse_player_info(html)
         current_team, past_teams = _parse_teams(html)
         agent_stats = _parse_agent_stats(html)
+        map_stats = _parse_map_stats(html)
         event_placements = _parse_event_placements(html)
         news = _parse_news(html)
         total_winnings = _parse_total_winnings(html)
@@ -497,6 +578,7 @@ async def vlr_player(player_id: str, timespan: str = "90d") -> dict:
             "current_team": current_team,
             "past_teams": past_teams,
             "agent_stats": agent_stats,
+            "map_stats": map_stats,
             "event_placements": event_placements,
             "news": news,
             "total_winnings": total_winnings,
