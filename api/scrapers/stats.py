@@ -222,21 +222,29 @@ def _classify_event_tier(name: str, region_key: str) -> float:
         return TIER_OTHER
     n = name.lower()
 
-    # Top tier: VCT proper, Masters, Champions, Lock-In
-    if "champions tour" in n or "vct champions" in n or "masters" in n or "lock-in" in n or "lock in" in n:
-        return TIER_VCT
-    # 'VCT' substring — but exclude Challengers/VCL/Ascension events that may also include 'VCT'
-    if " vct" in f" {n}" or n.startswith("vct"):
-        if "challengers" not in n and "vcl" not in n and "ascension" not in n:
-            return TIER_VCT
-
     # MrFunhaver-style tournaments — only count for NA
     if "funhaver" in n or "fun haver" in n or "mrfunhaver" in n:
         return TIER_FUNHAVER if region_key == "na" else TIER_OTHER
 
-    # VCL / Challengers / Ascension tier
-    if "vcl" in n or "challengers" in n or "ascension" in n:
+    # T2 markers take priority over the "Champions Tour" umbrella.
+    # VLR names a lot of T2 events as "Champions Tour 2026: Challengers
+    # <region>" — without this guard, the substring match below would
+    # promote every Challengers player to VCT. Same for Ascension and
+    # the "VCL <region>" naming.
+    if "challengers" in n or "vcl" in n or "ascension" in n or "promotion" in n:
         return TIER_VCL
+
+    # T1: VCT International League, Masters, Champions, Lock-In, Kickoff
+    if (
+        "masters" in n
+        or "vct champions" in n
+        or "lock-in" in n or "lock in" in n
+        or "kickoff" in n
+        or "champions tour" in n  # umbrella — only T1 once T2 ruled out above
+        or " vct" in f" {n}"
+        or n.startswith("vct")
+    ):
+        return TIER_VCT
 
     return TIER_OTHER
 
