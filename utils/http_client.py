@@ -117,13 +117,22 @@ async def _fetch_fresh(url: str, timeout: float) -> httpx.Response:
 # correlate poorly — at least one is usually working.
 import urllib.parse as _urlparse
 
+# Our own dedicated Cloudflare Worker proxy. Free tier allows
+# 100k req/day, runs on Cloudflare's edge (so request to vlr.gg
+# leaves from a stable Cloudflare IP, not Railway), and we control
+# the cookie/UA setup. This is tried FIRST — public proxies are the
+# fallback when our worker is unavailable or rate-limited.
+_VLRGG_PROXY_URL = "https://vlrgg-proxy.emirerdem2.workers.dev"
+
 _PROXY_URL_BUILDERS = [
-    # Pass-through CORS proxies — each returns the upstream response
-    # body unchanged. Crucial: the first version of this list also
-    # included r.jina.ai, which is a *reader* proxy that returns
-    # markdown-converted content. Our HTML parser then saw 0 rows
-    # and marked the scrape as a failure. Only true pass-throughs
-    # belong here.
+    # Dedicated Cloudflare Worker (priority).
+    lambda u: f"{_VLRGG_PROXY_URL}/?url={_urlparse.quote(u, safe='')}",
+    # Public pass-through CORS proxies — each returns the upstream
+    # response body unchanged. Crucial: the first version of this
+    # list also included r.jina.ai, which is a *reader* proxy that
+    # returns markdown-converted content. Our HTML parser then saw
+    # 0 rows and marked the scrape as a failure. Only true
+    # pass-throughs belong here.
     lambda u: f"https://api.allorigins.win/raw?url={_urlparse.quote(u, safe='')}",
     lambda u: f"https://corsproxy.io/?{_urlparse.quote(u, safe='')}",
     lambda u: f"https://api.codetabs.com/v1/proxy/?quest={_urlparse.quote(u, safe='')}",
@@ -142,8 +151,13 @@ async def _fetch_via_proxy(url: str, timeout: float) -> httpx.Response | None:
     that one provider into the ground.
 
     Returns None if every proxy fails for this request."""
-    builders = list(_PROXY_URL_BUILDERS)
-    _random.shuffle(builders)
+    # Always try our dedicated Worker first (index 0). Shuffle only
+    # the public-proxy fallbacks so concurrent sub-fetches don't all
+    # rate-limit the same provider when the Worker is unavailable.
+    primary = _PROXY_URL_BUILDERS[:1]
+    fallbacks = list(_PROXY_URL_BUILDERS[1:])
+    _random.shuffle(fallbacks)
+    builders = primary + fallbacks
     for build in builders:
         try:
             proxy_url = build(url)
