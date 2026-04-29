@@ -115,10 +115,19 @@ _PROXY_URL_BUILDERS = [
 ]
 
 
+import random as _random
+
 async def _fetch_via_proxy(url: str, timeout: float) -> httpx.Response | None:
-    """Try every proxy in turn; return the first 2xx response.
-    Returns None if every proxy fails."""
-    for build in _PROXY_URL_BUILDERS:
+    """Try proxies in randomized order until one returns 2xx.
+    Randomization spreads load across all five proxies — when 80
+    concurrent stats sub-fetches all fall through to this layer at
+    once, picking the same first proxy every time would rate-limit
+    that one provider into the ground.
+
+    Returns None if every proxy fails for this request."""
+    builders = list(_PROXY_URL_BUILDERS)
+    _random.shuffle(builders)
+    for build in builders:
         try:
             proxy_url = build(url)
             async with httpx.AsyncClient(
