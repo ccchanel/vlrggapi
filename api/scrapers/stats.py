@@ -233,6 +233,7 @@ MAX_EVENT_GROUPS_GC = 12
 
 TIER_VCT = 1.00          # VCT International League / Masters / Champions
 TIER_VCL = 0.85          # VCL / Challengers / Ascension
+TIER_GC = 0.85           # Game Changers — legit pro circuit, treat ~= VCL
 TIER_FUNHAVER = 0.75     # MrFunhaver tournaments (close to VCL but lower)
 TIER_OTHER = 0.50        # Anything else
 
@@ -247,6 +248,30 @@ def _classify_event_tier(name: str, region_key: str) -> float:
     if not name:
         return TIER_OTHER
     n = name.lower()
+
+    # Game Changers — Riot's professional women's circuit. The main GC
+    # league/stages ARE the top of their region (it's a self-contained
+    # circuit with one championship), so for the gc region they weight
+    # the same as VCT (1.0). Cash Cups are smaller side tournaments
+    # held alongside the main league — those drop to OTHER (0.5).
+    # This block goes FIRST so 'Champions Tour 2026: Game Changers'
+    # isn't misread as T1 by the champions-tour fallback below.
+    is_gc_event = (
+        "game changers" in n
+        or "gamechangers" in n.replace(" ", "")
+        or " gc " in f" {n} "
+        or "vctgc" in n.replace(" ", "")
+    )
+    if is_gc_event:
+        # Cash Cups are smaller side events; demote to OTHER so they
+        # don't inflate scores from a few low-stakes matches.
+        if "cash cup" in n or "cashcup" in n.replace(" ", ""):
+            return TIER_OTHER
+        # In the GC region the main league IS the top tier of the
+        # circuit, treat it as VCT-equivalent for that population.
+        # In other regions a stray GC event would still represent
+        # T2-equivalent skill (TIER_VCL).
+        return TIER_VCT if region_key == "gc" else TIER_VCL
 
     # MrFunhaver-style tournaments — only count for NA
     if "funhaver" in n or "fun haver" in n or "mrfunhaver" in n:
