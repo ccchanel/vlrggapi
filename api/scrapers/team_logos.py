@@ -38,15 +38,19 @@ logger = logging.getLogger(__name__)
 # button can bust this if needed.
 CACHE_TTL_TEAM_LOGOS = 6 * 60 * 60
 
-# Cap per-region team count. NA rankings has ~200 teams but most active
-# pro/semi-pro players are on the top ~120. Beyond that we hit dead orgs
-# that just slow the build down without adding logo coverage.
-MAX_TEAMS_PER_REGION = 120
+# Cap per-region team count. NA rankings has ~200 teams but the top 60
+# covers the realistic pro/semi-pro player base — ranks beyond that are
+# largely dormant orgs whose roster pages either 404 or eat the timeout
+# without contributing logos for any visible players. Empirically, 120
+# teams blew through the 240s hard timeout with most of the time spent
+# on dead-org requests retrying through the proxy chain.
+MAX_TEAMS_PER_REGION = 60
 
-# Concurrency for the /team/{id} fan-out. Higher than 8 starts hitting
-# VLR's anti-bot more aggressively; we get ~95% success at 8 with the
-# proxy fallthrough handling the rest.
-TEAM_FETCH_CONCURRENCY = 8
+# Concurrency for the /team/{id} fan-out. VLR's proxy chain (CF Worker
+# + 4 public fallbacks) starts dropping requests above 4-5 concurrent
+# /team page fetches. Lower concurrency completes the batch faster
+# overall because we avoid the retry storm.
+TEAM_FETCH_CONCURRENCY = 4
 
 
 def _normalize_logo_url(raw: str) -> str:
@@ -117,7 +121,16 @@ async def vlr_team_logos(region_key: str) -> dict:
             async with sem:
                 return t, await _fetch_team_safe(t["team_id"])
 
+        logger.info(
+            "team_logos: fanning out %d /team requests for region %s (concurrency=%d)",
+            len(team_seeds), region_key, TEAM_FETCH_CONCURRENCY,
+        )
         results = await asyncio.gather(*[bounded_fetch(t) for t in team_seeds])
+        ok_count = sum(1 for _, td in results if td)
+        logger.info(
+            "team_logos: %d/%d /team fetches succeeded for region %s",
+            ok_count, len(team_seeds), region_key,
+        )
 
         # Step 3: flatten roster into per-player rows
         rows: list[dict] = []
