@@ -195,24 +195,69 @@ MAX_EVENT_GROUPS_OPEN = 15
 MAX_EVENT_GROUPS_GC = 10
 
 
+# ── EVENT-TIER WEIGHTS ────────────────────────────────────────────────
+# Tier weight multiplies the contribution of a player's stats from
+# this event when aggregating across multiple events. Higher tier =
+# higher weight = those stats matter more.
+#
+# Goal: a T1 player in VCT looks better than a T2 player in VCL who
+# looks better than a regional player in MrFunhaver — but all three
+# are RECOGNISED by the scout score so up-and-coming talent surfaces.
+
+TIER_VCT = 1.00          # VCT International League / Masters / Champions
+TIER_VCL = 0.85          # VCL / Challengers / Ascension
+TIER_FUNHAVER = 0.75     # MrFunhaver tournaments (close to VCL but lower)
+TIER_OTHER = 0.50        # Anything else
+
+
+def _classify_event_tier(name: str, region_key: str) -> float:
+    """Return a multiplicative weight for stats from this event group.
+
+    `region_key` is the user-facing region; we only honour MrFunhaver
+    weighting in NA (where it's a recognised T2 circuit). In other
+    regions a Funhaver event would be downgraded to TIER_OTHER.
+    """
+    if not name:
+        return TIER_OTHER
+    n = name.lower()
+
+    # Top tier: VCT proper, Masters, Champions, Lock-In
+    if "champions tour" in n or "vct champions" in n or "masters" in n or "lock-in" in n or "lock in" in n:
+        return TIER_VCT
+    # 'VCT' substring — but exclude Challengers/VCL/Ascension events that may also include 'VCT'
+    if " vct" in f" {n}" or n.startswith("vct"):
+        if "challengers" not in n and "vcl" not in n and "ascension" not in n:
+            return TIER_VCT
+
+    # MrFunhaver-style tournaments — only count for NA
+    if "funhaver" in n or "fun haver" in n or "mrfunhaver" in n:
+        return TIER_FUNHAVER if region_key == "na" else TIER_OTHER
+
+    # VCL / Challengers / Ascension tier
+    if "vcl" in n or "challengers" in n or "ascension" in n:
+        return TIER_VCL
+
+    return TIER_OTHER
+
+
 async def _discover_event_group_ids(client) -> tuple[list, list]:
     """
-    Fetch the VLR.gg stats dropdown and return two lists, capped to
-    the most-recent N event groups (highest numeric IDs):
-      - open_ids:  non-GC events
+    Fetch the VLR.gg stats dropdown and return two lists of (id, name)
+    tuples, capped to the most-recent N events (highest numeric IDs):
+      - open_ids:  non-GC events (with names so callers can classify tier)
       - gc_ids:    Game Changers events
 
     Older events almost never produce any rows under a 60/90-day
-    timespan (the player didn't compete in them recently), so
-    scraping all 80+ historical events just wastes upstream calls
-    and increases the chance one of them rate-limits the whole batch.
+    timespan, so scraping the full ~80 wastes upstream calls and
+    increases proxy rate-limit risk.
     """
     resp = await fetch_with_retries(
         f"{VLR_STATS_URL}/", client=client, timeout=10, max_retries=1
     )
     html = HTMLParser(resp.text)
     select = html.css_first("select[name='event_group_id']")
-    open_ids, gc_ids = [], []
+    open_pairs: list[tuple[str, str]] = []
+    gc_pairs: list[tuple[str, str]] = []
     if select:
         for option in select.css("option"):
             val = option.attributes.get("value", "all")
@@ -220,25 +265,23 @@ async def _discover_event_group_ids(client) -> tuple[list, list]:
                 continue
             name = (option.text() or "").strip()
             if _is_gc_event(name):
-                gc_ids.append(val)
+                gc_pairs.append((val, name))
             else:
-                open_ids.append(val)
+                open_pairs.append((val, name))
 
-    # Sort by ID descending (newer events have higher IDs since they're
-    # auto-increment) and take the most recent N.
-    def _by_id_desc(ids):
+    def _by_id_desc(pairs):
         try:
-            return sorted(ids, key=lambda x: int(x), reverse=True)
+            return sorted(pairs, key=lambda x: int(x[0]), reverse=True)
         except ValueError:
-            return ids
+            return pairs
 
-    open_ids = _by_id_desc(open_ids)[:MAX_EVENT_GROUPS_OPEN]
-    gc_ids = _by_id_desc(gc_ids)[:MAX_EVENT_GROUPS_GC]
+    open_pairs = _by_id_desc(open_pairs)[:MAX_EVENT_GROUPS_OPEN]
+    gc_pairs = _by_id_desc(gc_pairs)[:MAX_EVENT_GROUPS_GC]
     logger.info(
-        "Using %d most-recent open event IDs and %d GC event IDs",
-        len(open_ids), len(gc_ids)
+        "Using %d most-recent open event groups and %d GC event groups",
+        len(open_pairs), len(gc_pairs)
     )
-    return open_ids, gc_ids
+    return open_pairs, gc_pairs
 
 
 def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
@@ -299,19 +342,27 @@ _PERCENT_FIELDS = (
 )
 
 
-def _merge(primary: list, secondary: list) -> list:
-    """Merge two player lists with rounds-weighted aggregation.
+def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
+    """Merge two player lists with tier×rounds-weighted aggregation.
 
     Each event_group_id we scrape returns per-event stats for the
     players who competed in it. A player with rows in 5 events should
-    show their TRUE 60-day average, not 'whichever event we hit first'.
+    show a tier-weighted aggregate that respects which tier the data
+    came from — VCT performance contributes more than VCL, which
+    contributes more than MrFunhaver / Other.
+
+    `secondary_tier` is the tier weight (0.5–1.0) for the rows we're
+    merging into the running primary. Each row's effective weight in
+    the average is `rounds × tier_weight`. The `_acc_weight` field on
+    each player accumulates the running total for chained merges.
 
     Aggregation rules:
-      - rounds_played: SUM
-      - rating, ACS, K:D, ADR, KPR/APR/FKPR/FDPR: rounds-weighted MEAN
-      - HS%, Clutch%, KAST%: rounds-weighted MEAN of percentages
-      - agents: union (preserves all agents played across events)
-      - org / team_full: keep first non-empty
+      - rounds_played: SUM (real rounds, unweighted)
+      - rating/ACS/K:D/ADR/KPR/APR/FKPR/FDPR: tier×rounds-weighted MEAN
+      - HS%/Clutch%/KAST%: tier×rounds-weighted MEAN
+      - agents: UNION across events
+      - event_tier: MAX (best tier the player has competed in)
+      - org/team_full: first non-empty
     """
     out = list(primary)
     by_id = {r["player_id"]: i for i, r in enumerate(out) if r.get("player_id")}
@@ -321,6 +372,11 @@ def _merge(primary: list, secondary: list) -> list:
         pid = r.get("player_id")
         idx = by_id.get(pid) if pid else by_name.get(r.get("player"))
         if idx is None:
+            # First time seeing this player — stamp tier metadata
+            r = dict(r)
+            new_rounds = _to_float(r.get("rounds_played"))
+            r["_acc_weight"] = new_rounds * secondary_tier
+            r["event_tier"] = round(secondary_tier, 2)
             out.append(r)
             if pid:
                 by_id[pid] = len(out) - 1
@@ -329,37 +385,36 @@ def _merge(primary: list, secondary: list) -> list:
             continue
 
         existing = out[idx]
-        old_rounds = _to_float(existing.get("rounds_played"))
+        old_w = float(existing.get("_acc_weight", 0.0)) or _to_float(existing.get("rounds_played"))
         new_rounds = _to_float(r.get("rounds_played"))
-        total_rounds = old_rounds + new_rounds
-        if total_rounds <= 0:
+        new_w = new_rounds * secondary_tier
+        total_w = old_w + new_w
+        if total_w <= 0:
             continue
 
-        # Rounds-weighted mean for per-round metrics
         for f in _WEIGHTED_FIELDS:
             old_v = _to_float(existing.get(f))
             new_v = _to_float(r.get(f))
-            avg = (old_v * old_rounds + new_v * new_rounds) / total_rounds
+            avg = (old_v * old_w + new_v * new_w) / total_w
             existing[f] = f"{avg:.2f}"
 
-        # Rounds-weighted mean for percentage metrics
         for f in _PERCENT_FIELDS:
             old_v = _to_float(existing.get(f))
             new_v = _to_float(r.get(f))
-            avg = (old_v * old_rounds + new_v * new_rounds) / total_rounds
-            # Preserve trailing % only if the inputs had it
+            avg = (old_v * old_w + new_v * new_w) / total_w
             had_pct = "%" in str(existing.get(f) or "") or "%" in str(r.get(f) or "")
             existing[f] = f"{round(avg)}%" if had_pct else f"{avg:.2f}"
 
-        existing["rounds_played"] = str(int(total_rounds))
+        old_rounds = _to_float(existing.get("rounds_played"))
+        existing["rounds_played"] = str(int(old_rounds + new_rounds))
+        existing["_acc_weight"] = total_w
+        existing["event_tier"] = round(max(float(existing.get("event_tier", 0.0)), secondary_tier), 2)
 
-        # Union of agents played across events
         agents_old = existing.get("agents") or []
         agents_new = r.get("agents") or []
         if agents_new:
             existing["agents"] = list(dict.fromkeys(list(agents_old) + list(agents_new)))
 
-        # Keep first non-empty for cosmetic fields
         for f in ("org", "team_full"):
             if not existing.get(f) or existing.get(f) in {"", "N/A"}:
                 if r.get(f) and r.get(f) not in {"", "N/A"}:
@@ -368,13 +423,39 @@ def _merge(primary: list, secondary: list) -> list:
     return out
 
 
-async def _fetch_all_for_region(region: str, timespan: str, ids: list, client) -> list:
+async def _fetch_all_for_region(
+    region: str,
+    timespan: str,
+    pairs_or_ids: list,
+    client,
+    region_key: str = None,
+) -> list:
+    """Scrape every event group in `pairs_or_ids` for the given region.
+
+    `pairs_or_ids` may be a list of (id, name) tuples (preferred —
+    enables tier weighting) OR plain id strings (legacy — falls back
+    to TIER_OTHER for everything).
+    """
+    # Normalize to (id, name) pairs
+    pairs = []
+    for item in pairs_or_ids:
+        if isinstance(item, tuple) and len(item) >= 2:
+            pairs.append((item[0], item[1] or ""))
+        else:
+            pairs.append((str(item), ""))
+
+    region_for_tier = region_key or region
     semaphore = asyncio.Semaphore(_SEMAPHORE_LIMIT)
-    urls = [_stats_url(eid, region, timespan) for eid in ids]
-    results = await asyncio.gather(*[_fetch_rows(u, client, semaphore) for u in urls])
-    merged = []
-    for rows in results:
-        merged = _merge(merged, rows)
+    urls = [_stats_url(eid, region, timespan) for eid, _ in pairs]
+    fetched = await asyncio.gather(*[_fetch_rows(u, client, semaphore) for u in urls])
+
+    merged: list = []
+    for (eid, name), rows in zip(pairs, fetched):
+        tier = _classify_event_tier(name, region_for_tier)
+        merged = _merge(merged, rows, secondary_tier=tier)
+    # Strip the internal accumulator before returning
+    for r in merged:
+        r.pop("_acc_weight", None)
     return merged
 
 
@@ -406,27 +487,21 @@ async def vlr_stats(region_key: str, timespan: str):
         open_ids, gc_ids = await _safe_discover(client)
 
         if region_key == "gc":
-            # 1. Try the per-event-group scrape using GC-tagged events
-            rows = await _fetch_all_for_region("gc", timespan, gc_ids, client) if gc_ids else []
-            # 2. If the keyword filter found nothing OR all GC events were empty,
-            #    fall back to a single event_group_id=all&region=gc request.
+            rows = await _fetch_all_for_region("gc", timespan, gc_ids, client, region_key="gc") if gc_ids else []
             if not rows:
                 rows = await _fetch_single_all("gc", timespan, client)
-            # 3. As a last resort scan EVERY event group with region=gc — slower
-            #    but guaranteed to surface any GC players present.
             if not rows and (open_ids or gc_ids):
-                all_ids = open_ids + gc_ids
-                rows = await _fetch_all_for_region("gc", timespan, all_ids, client)
+                all_pairs = list(open_ids) + list(gc_ids)
+                rows = await _fetch_all_for_region("gc", timespan, all_pairs, client, region_key="gc")
 
         elif region_key in LA_COMBINED:
             if open_ids:
                 las_rows, lan_rows = await asyncio.gather(
-                    _fetch_all_for_region("las", timespan, open_ids, client),
-                    _fetch_all_for_region("lan", timespan, open_ids, client),
+                    _fetch_all_for_region("las", timespan, open_ids, client, region_key="la"),
+                    _fetch_all_for_region("lan", timespan, open_ids, client, region_key="la"),
                 )
                 rows = _merge(las_rows, lan_rows)
             else:
-                # Discovery failed — single-shot fallback for both subregions
                 las_rows, lan_rows = await asyncio.gather(
                     _fetch_single_all("las", timespan, client),
                     _fetch_single_all("lan", timespan, client),
@@ -436,7 +511,7 @@ async def vlr_stats(region_key: str, timespan: str):
         else:
             vlr_region = VLR_REGION_MAP.get(region_key, region_key)
             if open_ids:
-                rows = await _fetch_all_for_region(vlr_region, timespan, open_ids, client)
+                rows = await _fetch_all_for_region(vlr_region, timespan, open_ids, client, region_key=region_key)
             else:
                 rows = await _fetch_single_all(vlr_region, timespan, client)
 
