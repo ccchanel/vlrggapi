@@ -164,9 +164,15 @@ async def vlr_team_logos(region_key: str) -> dict:
 # Sync helpers used by the v2 router (mirrors stats / player_resilient pattern)
 # ---------------------------------------------------------------------------
 
-_TEAM_LOGOS_BUILDS: dict[str, asyncio.Task] = {}
+import time as _time
+
+_BUILDING: set[str] = set()
 _TEAM_LOGOS_FAILED_AT: dict[str, float] = {}
 _FAIL_COOLDOWN_S = 60
+# Hard timeout for a full region build. ~120 teams × concurrency 8 → 15
+# batches; each /team/{id} fetch typically completes in 2-5s through
+# the proxy chain. 240s gives ~2x headroom over the realistic worst case.
+_BUILD_HARD_TIMEOUT = 240
 
 
 def get_cached_team_logos(region_key: str):
@@ -175,37 +181,54 @@ def get_cached_team_logos(region_key: str):
 
 
 def is_building_team_logos(region_key: str) -> bool:
-    task = _TEAM_LOGOS_BUILDS.get(region_key)
-    return task is not None and not task.done()
+    return region_key in _BUILDING
 
 
 def recently_failed_team_logos(region_key: str) -> bool:
-    import time
     ts = _TEAM_LOGOS_FAILED_AT.get(region_key, 0)
-    return (time.time() - ts) < _FAIL_COOLDOWN_S
+    return (_time.time() - ts) < _FAIL_COOLDOWN_S
 
 
-def start_background_team_logos_build(region_key: str) -> None:
-    """Kick off a background build the first time a region is requested."""
-    if is_building_team_logos(region_key):
-        return
-
-    async def _runner():
-        import time
-        try:
-            await vlr_team_logos(region_key)
-        except Exception as exc:
-            logger.warning(
-                "team_logos: background build for %s failed: %s",
-                region_key, exc,
-            )
-            _TEAM_LOGOS_FAILED_AT[region_key] = time.time()
-        finally:
-            _TEAM_LOGOS_BUILDS.pop(region_key, None)
-
+async def _background_build(region_key: str) -> None:
     try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    _TEAM_LOGOS_BUILDS[region_key] = loop.create_task(_runner())
+        result = await asyncio.wait_for(
+            vlr_team_logos(region_key),
+            timeout=_BUILD_HARD_TIMEOUT,
+        )
+        segments = (result or {}).get("data", {}).get("segments") or []
+        if not segments:
+            logger.warning(
+                "team_logos: background build for %s returned 0 rows",
+                region_key,
+            )
+            _TEAM_LOGOS_FAILED_AT[region_key] = _time.time()
+        else:
+            _TEAM_LOGOS_FAILED_AT.pop(region_key, None)
+            logger.info(
+                "team_logos: background build complete for %s (%d rows)",
+                region_key, len(segments),
+            )
+    except asyncio.TimeoutError:
+        logger.error(
+            "team_logos: background build TIMED OUT after %ds for %s",
+            _BUILD_HARD_TIMEOUT, region_key,
+        )
+        _TEAM_LOGOS_FAILED_AT[region_key] = _time.time()
+    except Exception as exc:
+        logger.error(
+            "team_logos: background build failed for %s: %s",
+            region_key, exc,
+        )
+        _TEAM_LOGOS_FAILED_AT[region_key] = _time.time()
+    finally:
+        _BUILDING.discard(region_key)
+
+
+def start_background_team_logos_build(region_key: str) -> bool:
+    """Kick off a background build the first time a region is requested."""
+    if region_key in _BUILDING:
+        return False
+    _BUILDING.add(region_key)
+    asyncio.create_task(_background_build(region_key))
+    logger.info("team_logos: background build started for %s", region_key)
+    return True
