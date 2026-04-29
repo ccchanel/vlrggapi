@@ -97,6 +97,42 @@ async def _fetch_fresh(url: str, timeout: float) -> httpx.Response:
         return await fresh.get(url)
 
 
+# Public read-through proxies. Tried in order when both direct attempts
+# (pool + fresh client) time out. These rewrite the upstream URL into
+# their own host but pass through the body unchanged, which is enough
+# for our scraper. Each is fronted by a different network so failures
+# correlate poorly — at least one is usually working.
+_PROXY_URL_BUILDERS = [
+    lambda u: f"https://r.jina.ai/{u}",
+    lambda u: f"https://api.allorigins.win/raw?url={u}",
+    lambda u: f"https://corsproxy.io/?{u}",
+]
+
+
+async def _fetch_via_proxy(url: str, timeout: float) -> httpx.Response | None:
+    """Try every proxy in turn; return the first 2xx response.
+    Returns None if every proxy fails."""
+    for build in _PROXY_URL_BUILDERS:
+        try:
+            proxy_url = build(url)
+            async with httpx.AsyncClient(
+                headers=headers,
+                timeout=httpx.Timeout(timeout),
+                follow_redirects=True,
+            ) as cli:
+                resp = await cli.get(proxy_url)
+                if 200 <= resp.status_code < 300 and resp.content:
+                    logger.warning(
+                        "Direct fetch failed for %s — succeeded via proxy %s",
+                        url, build(url).split("/")[2],
+                    )
+                    return resp
+        except Exception as exc:
+            logger.debug("Proxy attempt failed for %s: %s", url, exc)
+            continue
+    return None
+
+
 async def fetch_with_retries(
     url: str,
     *,
@@ -124,12 +160,13 @@ async def fetch_with_retries(
             _consecutive_timeouts = 0
         except httpx.TimeoutException:
             _consecutive_timeouts += 1
-            # Last-ditch: try once with a brand-new client. If THAT also
-            # times out, the upstream is genuinely unreachable.
+            # Two-stage fallback when the pool client times out:
+            # 1) Fresh client — eliminates stuck-keepalive issues
+            # 2) Public read-through proxy — eliminates Railway egress
+            #    issues to vlr.gg specifically (intermittent network
+            #    blocking has been observed)
             try:
-                logger.warning(
-                    "Pool fetch timed out for %s — trying fresh client.", url
-                )
+                logger.warning("Pool fetch timed out for %s — trying fresh client.", url)
                 fresh_resp = await _fetch_fresh(url, float(effective_timeout))
                 _consecutive_timeouts = 0
                 if _consecutive_timeouts >= _CONSECUTIVE_TIMEOUT_THRESHOLD:
@@ -137,9 +174,11 @@ async def fetch_with_retries(
                     _consecutive_timeouts = 0
                 return fresh_resp
             except Exception:
-                # Both pool and fresh client timed out — pool may be fine,
-                # the upstream is just down. Recycle the pool anyway and
-                # retry per the loop's normal retry budget.
+                logger.warning("Fresh client also timed out for %s — trying proxies.", url)
+                proxy_resp = await _fetch_via_proxy(url, float(effective_timeout))
+                if proxy_resp is not None:
+                    _consecutive_timeouts = 0
+                    return proxy_resp
                 if _consecutive_timeouts >= _CONSECUTIVE_TIMEOUT_THRESHOLD:
                     await reset_http_client()
                     _consecutive_timeouts = 0
