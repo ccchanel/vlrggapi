@@ -416,6 +416,7 @@ async def v2_event_matches(
 async def v2_team_logos(
     request: Request,
     region: str = Query(..., description="Region shortname (na, eu, ap, la, etc.)"),
+    force: bool = Query(False, description="Force a fresh build, ignoring cache"),
 ):
     """
     Bulk team-logo lookup for a region.
@@ -430,9 +431,16 @@ async def v2_team_logos(
     """
     validate_region(region)
 
-    cached = get_cached_team_logos(region)
-    if cached is not None:
-        return _wrap_v2(cached)
+    if force:
+        # Bust the in-process cache so the next call kicks a fresh build.
+        # Mirrors /v2/stats?force=true.
+        from utils.cache_manager import cache_manager
+        from api.scrapers.team_logos import CACHE_TTL_TEAM_LOGOS
+        cache_manager.invalidate(CACHE_TTL_TEAM_LOGOS, "team_logos", region)
+    else:
+        cached = get_cached_team_logos(region)
+        if cached is not None:
+            return _wrap_v2(cached)
 
     if recently_failed_team_logos(region):
         raise HTTPException(
