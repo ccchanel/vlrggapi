@@ -105,13 +105,17 @@ async def _fetch_fresh(url: str, timeout: float) -> httpx.Response:
 import urllib.parse as _urlparse
 
 _PROXY_URL_BUILDERS = [
-    # Reading-room proxy — designed for HTML extraction, very reliable
-    lambda u: f"https://r.jina.ai/{u}",
-    # General CORS proxies, each on different infrastructure
+    # Pass-through CORS proxies — each returns the upstream response
+    # body unchanged. Crucial: the first version of this list also
+    # included r.jina.ai, which is a *reader* proxy that returns
+    # markdown-converted content. Our HTML parser then saw 0 rows
+    # and marked the scrape as a failure. Only true pass-throughs
+    # belong here.
     lambda u: f"https://api.allorigins.win/raw?url={_urlparse.quote(u, safe='')}",
     lambda u: f"https://corsproxy.io/?{_urlparse.quote(u, safe='')}",
     lambda u: f"https://api.codetabs.com/v1/proxy/?quest={_urlparse.quote(u, safe='')}",
     lambda u: f"https://thingproxy.freeboard.io/fetch/{u}",
+    lambda u: f"https://api.cors.lol/?url={_urlparse.quote(u, safe='')}",
 ]
 
 
@@ -136,12 +140,23 @@ async def _fetch_via_proxy(url: str, timeout: float) -> httpx.Response | None:
                 follow_redirects=True,
             ) as cli:
                 resp = await cli.get(proxy_url)
-                if 200 <= resp.status_code < 300 and resp.content:
-                    logger.warning(
-                        "Direct fetch failed for %s — succeeded via proxy %s",
-                        url, build(url).split("/")[2],
-                    )
-                    return resp
+                if not (200 <= resp.status_code < 300 and resp.content):
+                    continue
+                # Sanity-check the body actually LOOKS like HTML from
+                # vlr.gg. Some proxies happily return JSON error pages
+                # with a 200; some apply transformations (markdown,
+                # text-only) we can't parse. Sniff for HTML markers
+                # and the vlr.gg-specific 'wf-' class prefix as proof
+                # of a real upstream response.
+                body_lower = resp.text[:4096].lower()
+                if "<html" not in body_lower and "<!doctype" not in body_lower:
+                    logger.debug("Proxy %s returned non-HTML for %s; skipping", build(url).split("/")[2], url)
+                    continue
+                logger.warning(
+                    "Direct fetch failed for %s — succeeded via proxy %s",
+                    url, build(url).split("/")[2],
+                )
+                return resp
         except Exception as exc:
             logger.debug("Proxy attempt failed for %s: %s", url, exc)
             continue
