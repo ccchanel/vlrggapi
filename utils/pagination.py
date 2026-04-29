@@ -9,7 +9,7 @@ from typing import Callable, List
 from fastapi import HTTPException
 from selectolax.parser import HTMLParser
 
-from utils.http_client import get_http_client
+from utils.http_client import fetch_with_retries, get_http_client
 from utils.constants import (
     DEFAULT_RETRIES,
     DEFAULT_REQUEST_DELAY,
@@ -124,7 +124,14 @@ async def scrape_multiple_pages(
                     retry_count + 1, config.max_retries,
                 )
 
-                resp = await client.get(url, timeout=config.timeout)
+                # Route through fetch_with_retries so we get the
+                # direct → fresh-client → proxy chain (incl. our
+                # Cloudflare Worker). client.get() bypasses all of
+                # that and dies the moment Railway egress to vlr.gg
+                # is blocked, which is most of the time.
+                resp = await fetch_with_retries(
+                    url, client=client, timeout=config.timeout, max_retries=1,
+                )
 
                 if resp.status_code != 200:
                     logger.warning("Page %d returned status %d", page, resp.status_code)
@@ -161,14 +168,24 @@ async def scrape_multiple_pages(
         len(result), successful_pages, total_pages,
     )
 
-    if failed_pages:
+    # Tolerate partial pagination failure: as long as we got at
+    # least one page back, return what we have. The frontend
+    # would rather show a partial calendar than nothing at all,
+    # and a transient block on page 2 shouldn't 502 the whole
+    # request when page 1's data is already in hand.
+    if failed_pages and not result:
         failed_pages_text = ", ".join(str(page) for page in failed_pages)
         raise HTTPException(
             status_code=502,
             detail=(
-                "Failed to fetch all requested pages from VLR.GG. "
+                "Failed to fetch any requested pages from VLR.GG. "
                 f"Pages with exhausted retries: {failed_pages_text}."
             ),
+        )
+    if failed_pages:
+        failed_pages_text = ", ".join(str(page) for page in failed_pages)
+        logger.warning(
+            "Returning partial result — failed pages: %s", failed_pages_text,
         )
 
     return {
