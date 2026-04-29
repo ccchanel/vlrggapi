@@ -176,11 +176,25 @@ def _parse_stats_row(item) -> dict:
             continue
         agents.append(src.split("/")[-1].split(".")[0])
 
+    # Country flag — VLR uses <i class="flag mod-us"> (or mod-gb, mod-kr, etc.)
+    # Extract the 2-letter ISO country code from that class so the frontend
+    # can render a flag emoji or icon under the player name.
+    country = ""
+    if player_cell:
+        flag_node = player_cell.css_first("i.flag")
+        if flag_node:
+            cls = flag_node.attributes.get("class", "") or ""
+            for token in cls.split():
+                if token.startswith("mod-") and len(token) == 6:
+                    country = token[4:].lower()
+                    break
+
     return {
         "player": player_name,
         "org": org,
         "team_full": team_full,
         "player_id": player_id,
+        "country": country,
         "agents": agents,
         "rounds_played": _cell_text(cells, 2),
         "rating": _cell_text(cells, 3),
@@ -491,7 +505,7 @@ def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
         if agents_new:
             existing["agents"] = list(dict.fromkeys(list(agents_old) + list(agents_new)))
 
-        for f in ("org", "team_full"):
+        for f in ("org", "team_full", "country"):
             if not existing.get(f) or existing.get(f) in {"", "N/A"}:
                 if r.get(f) and r.get(f) not in {"", "N/A"}:
                     existing[f] = r[f]
