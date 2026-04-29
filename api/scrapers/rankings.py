@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 
@@ -9,6 +10,14 @@ from utils.cache_manager import cache_manager
 from utils.error_handling import handle_scraper_errors, validate_region
 
 logger = logging.getLogger(__name__)
+
+# Hard timeout for a single rankings build. Without this, a hung
+# upstream (AP / LA / KR / BR / JP / CN have all been seen to stall
+# the proxy chain) would pin the cache_manager's coalesced build task
+# indefinitely — every subsequent caller would await the same dead
+# task. 25s is enough for the cached path (<1s) and a normal cold
+# scrape (~5-10s through the CF Worker proxy).
+_RANKINGS_BUILD_TIMEOUT = 25
 
 
 def _normalize_text(value: str) -> str:
@@ -105,7 +114,19 @@ async def vlr_rankings(region_key):
         url = f"{VLR_RANKINGS_URL}/{region_name}"
 
         client = get_http_client()
-        resp = await fetch_with_retries(url, client=client)
+        try:
+            resp = await asyncio.wait_for(
+                fetch_with_retries(url, client=client),
+                timeout=_RANKINGS_BUILD_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Rankings scrape for %s timed out after %ds — returning 503 so cache_manager doesn't pin a hung task and doesn't cache the failure",
+                region_key, _RANKINGS_BUILD_TIMEOUT,
+            )
+            # Status >= 400 means cache_manager.set_if_cacheable will
+            # SKIP caching this — next caller gets a fresh attempt.
+            return {"data": {"status": 503, "segments": [], "error": "rankings scrape timed out"}}
         html = HTMLParser(resp.text)
         status = resp.status_code
 
