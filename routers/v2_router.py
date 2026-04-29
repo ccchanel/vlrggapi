@@ -26,12 +26,16 @@ from api.scrapers.stats import get_cached_stats, is_building, recently_failed, s
 from api.scrapers.player_resilient import (
     get_cached_player,
     get_cached_player_matches,
+    get_cached_match_detail,
     is_building_player,
     is_building_matches,
+    is_building_match_detail,
     recently_failed_player,
     recently_failed_matches,
+    recently_failed_match_detail,
     start_persistent_player_fetch,
     start_persistent_matches_fetch,
+    start_persistent_match_detail_fetch,
 )
 from utils.constants import RATE_LIMIT, MAX_MATCH_QUERY_BOUND
 from utils.error_handling import (
@@ -187,22 +191,33 @@ async def v2_events(
     return _wrap_v2(result)
 
 
-@router.get("/match/details", response_model=V2Response)
+@router.get("/match/details")
 @limiter.limit(RATE_LIMIT)
 async def v2_match_detail(
     request: Request,
     match_id: str = Query(..., description="VLR.GG match ID"),
 ):
     """
-    Get detailed match data.
-
-    Includes per-map stats (player K/D/A, ACS, rating), round-by-round data,
-    head-to-head history, performance tab (kill matrix, advanced stats),
-    and economy tab data.
+    Resilient match-detail endpoint with 202/poll fallback.
+    Returns 200 with full match data when cached, or 202 {status:"building"}
+    while a persistent background worker fetches the upstream pages.
     """
     validate_id_param(match_id, "match_id")
-    result = await get_match_detail_data(match_id)
-    return _wrap_v2(result)
+
+    cached = get_cached_match_detail(match_id)
+    if cached is not None:
+        return _wrap_v2(cached)
+
+    if recently_failed_match_detail(match_id):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Recent attempts to fetch match {match_id} failed. Try again in ~1 minute.",
+        )
+
+    if not is_building_match_detail(match_id):
+        start_persistent_match_detail_fetch(match_id)
+
+    return JSONResponse({"status": "building"}, status_code=202)
 
 
 @router.get("/health/upstream")

@@ -57,12 +57,26 @@ def get_cached_player_matches(player_id: str, page: int = 1):
     return cache_manager.get(CACHE_TTL_PLAYER_MATCHES, "player_matches", player_id, page)
 
 
+def get_cached_match_detail(match_id: str):
+    from utils.constants import CACHE_TTL_MATCH_DETAIL
+    return cache_manager.get(CACHE_TTL_MATCH_DETAIL, "match_detail", match_id)
+
+
 def is_building_player(player_id: str, timespan: str = "90d") -> bool:
     return _job_key("player", player_id, timespan) in _building
 
 
 def is_building_matches(player_id: str, page: int = 1) -> bool:
     return _job_key("matches", player_id, page) in _building
+
+
+def is_building_match_detail(match_id: str) -> bool:
+    return _job_key("match_detail", match_id) in _building
+
+
+def recently_failed_match_detail(match_id: str) -> bool:
+    ts = _failed.get(_job_key("match_detail", match_id))
+    return bool(ts and (time.time() - ts) < FAILURE_BACKOFF)
 
 
 def recently_failed_player(player_id: str, timespan: str = "90d") -> bool:
@@ -165,4 +179,19 @@ def start_persistent_matches_fetch(player_id: str, page: int = 1) -> bool:
         return await vlr_player_matches(player_id, page)
 
     asyncio.create_task(_persistent_fetch(f"matches[{player_id} p={page}]", job_key, factory))
+    return True
+
+
+def start_persistent_match_detail_fetch(match_id: str) -> bool:
+    job_key = _job_key("match_detail", match_id)
+    if job_key in _building:
+        return False
+    _building.add(job_key)
+
+    from api.scrapers.match_detail import vlr_match_detail
+
+    async def factory():
+        return await vlr_match_detail(match_id)
+
+    asyncio.create_task(_persistent_fetch(f"match_detail[{match_id}]", job_key, factory))
     return True
