@@ -242,9 +242,24 @@ def _classify_event_tier(name: str, region_key: str) -> float:
     # VLR names a lot of T2 events as "Champions Tour 2026: Challengers
     # <region>" — without this guard, the substring match below would
     # promote every Challengers player to VCT. Same for Ascension and
-    # the "VCL <region>" naming.
-    if "challengers" in n or "vcl" in n or "ascension" in n or "promotion" in n:
+    # the "VCL <region>" naming. Also catch "Partner Series" — VLR's
+    # tier-2 invitational that mixes Challengers + Partner orgs but is
+    # NOT VCT proper. Players like kozzy/Proxh/Lime on Enterprise
+    # Esports compete here and should keep their VCL tag.
+    if (
+        "challengers" in n
+        or "vcl" in n
+        or "ascension" in n
+        or "promotion" in n
+        or "partner series" in n
+    ):
         return TIER_VCL
+
+    # OFF//SEASON tournaments are mixed-tier exhibitions — real VCT
+    # teams scrim alongside open-circuit teams. Bucketing them as VCT
+    # falsely inflates lower-tier participants. Treat as OTHER.
+    if "off//season" in n or "off-season" in n or "offseason" in n:
+        return TIER_OTHER
 
     # T1: VCT International League, Masters, Champions, Lock-In, Kickoff
     if (
