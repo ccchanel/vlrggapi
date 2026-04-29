@@ -14,8 +14,9 @@ from utils.html_parsers import extract_text_content
 _building: set[str] = set()
 _failed_builds: dict[str, float] = {}  # job_key → unix timestamp of last failure
 _FAILURE_BACKOFF = 60  # seconds before we retry after a failed build
-_BUILD_HARD_TIMEOUT = 180  # seconds — at semaphore=8 with ~80 sub-fetches
-                            # the slow path (proxy fallback) can take >90s.
+_BUILD_HARD_TIMEOUT = 240  # seconds — 25 event groups × up to 3 retries
+                            # each, semaphore=8 → worst case ~10 batches
+                            # × ~12s = 120s. 240s gives 2× headroom.
 
 def _job_key(region_key: str, timespan: str) -> str:
     return f"stats:{region_key}:{timespan}"
@@ -191,8 +192,8 @@ def _parse_stats_row(item) -> dict:
 # proxy load from ~80 sub-fetches to ~MAX_EVENT_GROUPS, which is the
 # difference between 'often fails because proxies rate-limit' and
 # 'completes in <60s every time'.
-MAX_EVENT_GROUPS_OPEN = 15
-MAX_EVENT_GROUPS_GC = 10
+MAX_EVENT_GROUPS_OPEN = 25
+MAX_EVENT_GROUPS_GC = 12
 
 
 # ── EVENT-TIER WEIGHTS ────────────────────────────────────────────────
@@ -294,21 +295,52 @@ def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
 
 
 async def _fetch_rows(url: str, client, semaphore: asyncio.Semaphore) -> list:
+    """Fetch one event_group's stats rows. Retries up to 3 times when
+    we get an empty result, because:
+      - proxies sometimes return a VLR redirect (default /stats page,
+        no rows match our region filter → 0 rows)
+      - proxies sometimes return cached/transformed content
+      - first call may have hit a rate-limited proxy
+
+    Each retry rolls a fresh proxy randomization in _fetch_via_proxy
+    (when direct fails / circuit breaker is tripped), so consecutive
+    attempts hit different upstream paths.
+    """
     async with semaphore:
-        try:
-            resp = await fetch_with_retries(url, client=client, timeout=15, max_retries=1)
-            if resp.status_code != 200:
-                return []
-            html = HTMLParser(resp.text)
-            rows = []
-            for item in html.css("tbody tr"):
-                parsed = _parse_stats_row(item)
-                if parsed["player"]:
-                    rows.append(parsed)
-            return rows
-        except Exception as exc:
-            logger.warning("Failed to fetch %s: %s", url, exc)
-            return []
+        for attempt in range(3):
+            try:
+                resp = await fetch_with_retries(
+                    url, client=client, timeout=15, max_retries=1
+                )
+                if resp.status_code != 200:
+                    if attempt < 2:
+                        await asyncio.sleep(0.4)
+                        continue
+                    return []
+                html = HTMLParser(resp.text)
+                rows = []
+                for item in html.css("tbody tr"):
+                    parsed = _parse_stats_row(item)
+                    if parsed["player"]:
+                        rows.append(parsed)
+                # If we got rows OR this is the last attempt, accept it
+                if rows or attempt >= 2:
+                    return rows
+                # Empty result from a 200 response — likely a redirect
+                # to /stats (event_group_id mismatch) or cached page.
+                # Retry through a different proxy path.
+                logger.debug(
+                    "Empty rows from %s on attempt %d — retrying", url, attempt + 1
+                )
+                await asyncio.sleep(0.4)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch %s (attempt %d): %s", url, attempt + 1, exc
+                )
+                if attempt >= 2:
+                    return []
+                await asyncio.sleep(0.5)
+        return []
 
 
 def _to_float(s: str) -> float:
