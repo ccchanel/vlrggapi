@@ -102,10 +102,16 @@ async def _fetch_fresh(url: str, timeout: float) -> httpx.Response:
 # their own host but pass through the body unchanged, which is enough
 # for our scraper. Each is fronted by a different network so failures
 # correlate poorly — at least one is usually working.
+import urllib.parse as _urlparse
+
 _PROXY_URL_BUILDERS = [
+    # Reading-room proxy — designed for HTML extraction, very reliable
     lambda u: f"https://r.jina.ai/{u}",
-    lambda u: f"https://api.allorigins.win/raw?url={u}",
-    lambda u: f"https://corsproxy.io/?{u}",
+    # General CORS proxies, each on different infrastructure
+    lambda u: f"https://api.allorigins.win/raw?url={_urlparse.quote(u, safe='')}",
+    lambda u: f"https://corsproxy.io/?{_urlparse.quote(u, safe='')}",
+    lambda u: f"https://api.codetabs.com/v1/proxy/?quest={_urlparse.quote(u, safe='')}",
+    lambda u: f"https://thingproxy.freeboard.io/fetch/{u}",
 ]
 
 
