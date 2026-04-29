@@ -14,7 +14,8 @@ from utils.html_parsers import extract_text_content
 _building: set[str] = set()
 _failed_builds: dict[str, float] = {}  # job_key → unix timestamp of last failure
 _FAILURE_BACKOFF = 60  # seconds before we retry after a failed build
-_BUILD_HARD_TIMEOUT = 90  # seconds — kill a build that runs longer than this
+_BUILD_HARD_TIMEOUT = 180  # seconds — at semaphore=8 with ~80 sub-fetches
+                            # the slow path (proxy fallback) can take >90s.
 
 def _job_key(region_key: str, timespan: str) -> str:
     return f"stats:{region_key}:{timespan}"
@@ -99,8 +100,11 @@ VLR_REGION_MAP = {
 # "la" splits into las + lan
 LA_COMBINED = {"la"}
 
-# Concurrent requests — high enough to be fast, low enough to avoid rate-limiting
-_SEMAPHORE_LIMIT = 20
+# Concurrent requests — gentler concurrency keeps VLR.gg from
+# rate-limiting us during a full-region scrape. Empirically, 20
+# triggered occasional empty responses on subsequent regions; 8
+# completes consistently.
+_SEMAPHORE_LIMIT = 8
 
 # Keywords that identify Game Changers events (case-insensitive). We strip
 # whitespace/punctuation before checking so 'game-changers' or 'GameChangers'
