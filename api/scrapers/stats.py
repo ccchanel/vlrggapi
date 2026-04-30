@@ -234,6 +234,14 @@ MAX_EVENT_GROUPS_GC = 12
 TIER_VCT = 1.00          # VCT International League / Masters / Champions
 TIER_VCL = 0.85          # VCL / Challengers / Ascension
 TIER_GC = 0.85           # Game Changers — legit pro circuit, treat ~= VCL
+                         # (used when a stray GC event surfaces on a
+                         # non-gc region request)
+TIER_GC_MINOR = 0.80     # Game Changers regional leagues outside the
+                         # four major franchise regions (LATAM, Oceania,
+                         # MENA, Asia, etc.) when the user is on the gc
+                         # region. Talent pool is shallower than EMEA /
+                         # NA / APAC / Brazil so raw stats don't
+                         # translate 1:1.
 TIER_FUNHAVER = 0.75     # MrFunhaver tournaments (close to VCL but lower)
 TIER_RIVALS = 0.65       # EU Rivals League / open + closed qualifiers —
                          # semi-pro circuit one rung below Challengers.
@@ -242,6 +250,28 @@ TIER_RIVALS = 0.65       # EU Rivals League / open + closed qualifiers —
                          # disambiguated by the frontend so the label
                          # reads "RIVALS" on EU rows.
 TIER_OTHER = 0.50        # Anything else
+
+
+# GC sub-region detection. Match on the event name (already lowercased
+# by the caller). The four major franchise regions Riot runs full GC
+# leagues for keep TIER_VCT; everything else drops to TIER_GC_MINOR.
+def _is_gc_major_region(event_name_lower: str) -> bool:
+    n = event_name_lower
+    padded = f" {n} "
+    # EMEA — single distinctive token, safe to match anywhere.
+    if "emea" in n:
+        return True
+    # North America. 'NA' as a bare token is dangerous (it appears in
+    # 'mena', 'final', etc.) so require boundary.
+    if "north america" in n or " na " in padded or " na:" in n:
+        return True
+    # APAC / Pacific.
+    if "apac" in n or "pacific" in n:
+        return True
+    # Brazil (English + Portuguese spelling).
+    if "brazil" in n or "brasil" in n:
+        return True
+    return False
 
 
 def _classify_event_tier(name: str, region_key: str) -> float:
@@ -274,10 +304,19 @@ def _classify_event_tier(name: str, region_key: str) -> float:
         if "cash cup" in n or "cashcup" in n.replace(" ", ""):
             return TIER_OTHER
         # In the GC region the main league IS the top tier of the
-        # circuit, treat it as VCT-equivalent for that population.
+        # circuit. Within that, the four major franchise regions
+        # (EMEA, NA, APAC/Pacific, Brazil) carry full TIER_VCT
+        # weight; smaller regional GC leagues (LATAM, Oceania,
+        # MENA, Asia) take a 20% haircut to TIER_GC_MINOR (0.80)
+        # because the talent pool is shallower and raw stats from
+        # those populations don't translate 1:1 with the majors.
+        # The match is on the EVENT name, so it reflects which
+        # league the team competed in (not where the player is from).
+        if region_key == "gc":
+            return TIER_VCT if _is_gc_major_region(n) else TIER_GC_MINOR
         # In other regions a stray GC event would still represent
         # T2-equivalent skill (TIER_VCL).
-        return TIER_VCT if region_key == "gc" else TIER_VCL
+        return TIER_VCL
 
     # MrFunhaver-style tournaments — only count for NA
     if "funhaver" in n or "fun haver" in n or "mrfunhaver" in n:
