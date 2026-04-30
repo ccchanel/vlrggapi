@@ -218,7 +218,7 @@ def _parse_stats_row(item) -> dict:
 # proxy load from ~80 sub-fetches to ~MAX_EVENT_GROUPS, which is the
 # difference between 'often fails because proxies rate-limit' and
 # 'completes in <60s every time'.
-MAX_EVENT_GROUPS_OPEN = 25
+MAX_EVENT_GROUPS_OPEN = 60
 MAX_EVENT_GROUPS_GC = 12
 
 
@@ -759,12 +759,19 @@ async def vlr_stats(region_key: str, timespan: str, exclude_funhaver: bool = Fal
                 rows = await _fetch_all_for_region("gc", timespan, all_pairs, client, region_key="gc")
 
         elif region_key in LA_COMBINED:
+            # LATAM combined: walk per-event AND merge in event_group=all.
+            # Per-event alone misses events outside the top-60 cap;
+            # all-events-mode picks up the long tail. Region filter
+            # (las/lan) is applied server-side both ways, so leaks are
+            # bounded.
             if open_ids:
-                las_rows, lan_rows = await asyncio.gather(
+                las_rows, lan_rows, las_all, lan_all = await asyncio.gather(
                     _fetch_all_for_region("las", timespan, open_ids, client, region_key="la"),
                     _fetch_all_for_region("lan", timespan, open_ids, client, region_key="la"),
+                    _fetch_single_all("las", timespan, client),
+                    _fetch_single_all("lan", timespan, client),
                 )
-                rows = _merge(las_rows, lan_rows)
+                rows = _merge(_merge(las_rows, lan_rows), _merge(las_all, lan_all))
             else:
                 las_rows, lan_rows = await asyncio.gather(
                     _fetch_single_all("las", timespan, client),
@@ -775,7 +782,19 @@ async def vlr_stats(region_key: str, timespan: str, exclude_funhaver: bool = Fal
         else:
             vlr_region = VLR_REGION_MAP.get(region_key, region_key)
             if open_ids:
-                rows = await _fetch_all_for_region(vlr_region, timespan, open_ids, client, region_key=region_key)
+                # For LATAM South / LATAM North standalone (and any
+                # other small region where most top-60 events return 0
+                # rows under the region filter) augment per-event with
+                # event_group=all so we don't miss the long tail of
+                # smaller leagues. Costs one extra request per region.
+                if region_key in ("la-s", "la-n"):
+                    per_event, all_events = await asyncio.gather(
+                        _fetch_all_for_region(vlr_region, timespan, open_ids, client, region_key=region_key),
+                        _fetch_single_all(vlr_region, timespan, client),
+                    )
+                    rows = _merge(per_event, all_events)
+                else:
+                    rows = await _fetch_all_for_region(vlr_region, timespan, open_ids, client, region_key=region_key)
             else:
                 rows = await _fetch_single_all(vlr_region, timespan, client)
 
