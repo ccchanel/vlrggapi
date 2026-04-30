@@ -637,6 +637,13 @@ def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
             new_rounds = _to_float(r.get("rounds_played"))
             r["_acc_weight"] = new_rounds * secondary_tier
             r["event_tier"] = round(secondary_tier, 2)
+            # Track VCL+ rounds separately so the frontend can label
+            # "primarily VCL or not" off the actual round percentage,
+            # not a tier-weighted mean (which folds OTHER and RIVALS
+            # together unevenly). VCL+ = TIER_VCL or higher.
+            is_vcl_plus = secondary_tier >= TIER_VCL
+            r["_vcl_rounds"] = new_rounds if is_vcl_plus else 0
+            r["vcl_round_pct"] = 1.0 if is_vcl_plus else 0.0
             out.append(r)
             if pid:
                 by_id[pid] = len(out) - 1
@@ -677,6 +684,18 @@ def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
         total_rounds_int = int(total_rounds)
         if total_rounds_int > 0:
             existing["event_tier"] = round(total_w_tier / total_rounds_int, 2)
+
+        # VCL+ rounds tracker — independent of tier-weighted mean.
+        # Frontend uses vcl_round_pct directly for the EU label
+        # (≥80% VCL+ rounds → VCL, else T3) so a player with 25%
+        # off-season + 75% VCL doesn't get misclassified by the
+        # tier-mean math (which folds OTHER and RIVALS unevenly).
+        old_vcl_rounds = _to_float(existing.get("_vcl_rounds", 0))
+        new_vcl_rounds = new_rounds if secondary_tier >= TIER_VCL else 0
+        total_vcl_rounds = old_vcl_rounds + new_vcl_rounds
+        existing["_vcl_rounds"] = total_vcl_rounds
+        if total_rounds_int > 0:
+            existing["vcl_round_pct"] = round(total_vcl_rounds / total_rounds, 3)
 
         agents_old = existing.get("agents") or []
         agents_new = r.get("agents") or []
@@ -725,6 +744,7 @@ async def _fetch_all_for_region(
     # Strip the internal accumulator before returning
     for r in merged:
         r.pop("_acc_weight", None)
+        r.pop("_vcl_rounds", None)
     return merged
 
 
