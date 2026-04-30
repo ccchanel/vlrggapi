@@ -235,6 +235,11 @@ TIER_VCT = 1.00          # VCT International League / Masters / Champions
 TIER_VCL = 0.85          # VCL / Challengers / Ascension
 TIER_GC = 0.85           # Game Changers — legit pro circuit, treat ~= VCL
 TIER_FUNHAVER = 0.75     # MrFunhaver tournaments (close to VCL but lower)
+TIER_RIVALS = 0.75       # EU Rivals League / open qualifiers — semi-pro
+                         # circuit one rung below Challengers. Same
+                         # weight as Funhaver; region-disambiguated by
+                         # the frontend so the label reads "RIVALS"
+                         # (EU) vs "FUN" (NA).
 TIER_OTHER = 0.50        # Anything else
 
 
@@ -276,6 +281,22 @@ def _classify_event_tier(name: str, region_key: str) -> float:
     # MrFunhaver-style tournaments — only count for NA
     if "funhaver" in n or "fun haver" in n or "mrfunhaver" in n:
         return TIER_FUNHAVER if region_key == "na" else TIER_OTHER
+
+    # EU semi-pro circuit (region-scoped) — Rivals League and the open
+    # qualifiers that feed Challengers. Lower-stakes than VCL but
+    # higher than 'Other'. Match before VCL/VCT keyword checks so
+    # 'Challengers Open Qualifier' lands here, not in TIER_VCL.
+    if region_key == "eu":
+        is_qualifier = (
+            "open qualifier" in n
+            or "closed qualifier" in n
+            or "open league" in n
+            # Bare 'qualifier' is intentionally NOT matched here — VLR
+            # uses 'Last Chance Qualifier' for high-stakes T1 events.
+        )
+        is_rivals = "rivals" in n
+        if is_qualifier or is_rivals:
+            return TIER_RIVALS
 
     # T2 markers take priority over the "Champions Tour" umbrella.
     # VLR names a lot of T2 events as "Champions Tour 2026: Challengers
