@@ -428,7 +428,7 @@ async def _discover_event_group_ids(client) -> tuple[list, list, list]:
     return open_pairs, gc_pairs, funhaver_pairs
 
 
-def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
+def _stats_url(event_group_id: str, region: str, timespan: str, page: int = 1) -> str:
     # Frontend now passes "30", "60", "90", or "365" — append the
     # 'd' suffix VLR's URL expects. The legacy "all" value is still
     # tolerated for cached/stale clients that haven't reloaded yet.
@@ -445,15 +445,28 @@ def _stats_url(event_group_id: str, region: str, timespan: str) -> str:
     # her real 1.04 / 228 across 408 rounds at min_rating=0). We
     # always want the full denominator so per-player rating/ACS
     # match what's on the player's profile page.
+    page_param = f"&page={page}" if page > 1 else ""
     return (
         f"{VLR_STATS_URL}/?event_group_id={event_group_id}&event_id=all"
         f"&region={region}&country=all&min_rounds=0"
-        f"&min_rating=0&agent=all&map_id=all&timespan={ts}"
+        f"&min_rating=0&agent=all&map_id=all&timespan={ts}{page_param}"
     )
 
 
-async def _fetch_rows(url: str, client, semaphore: asyncio.Semaphore) -> list:
-    """Fetch one event_group's stats rows. Retries up to 3 times when
+# VLR paginates the stats table at ~50 rows per page. Without paging we
+# only get page 1 per event group, which left smaller regions (LATAM,
+# Pacific minor leagues) with as few as ~64 unique players after dedup
+# across event groups — not because the region is small, but because
+# the first-page-50 of each event mostly overlaps. Walk pages until one
+# returns short, capped so a single mis-served URL can't loop forever.
+_STATS_PAGE_SIZE_THRESHOLD = 50  # VLR's default; if a page returns
+                                  # fewer than this, we've hit the end.
+_MAX_PAGES_PER_EVENT = 10        # 10 × 50 = 500 max per event, more
+                                  # than any real VLR event has.
+
+
+async def _fetch_one_page(url: str, client, semaphore: asyncio.Semaphore) -> list:
+    """Fetch a single page of stats rows. Retries up to 3 times when
     we get an empty result, because:
       - proxies sometimes return a VLR redirect (default /stats page,
         no rows match our region filter → 0 rows)
@@ -499,6 +512,43 @@ async def _fetch_rows(url: str, client, semaphore: asyncio.Semaphore) -> list:
                     return []
                 await asyncio.sleep(0.5)
         return []
+
+
+async def _fetch_rows(
+    event_group_id: str,
+    region: str,
+    timespan: str,
+    client,
+    semaphore: asyncio.Semaphore,
+) -> list:
+    """Fetch every page of stats rows for a single event_group_id.
+
+    VLR paginates at ~50 rows/page — without walking pages we'd only
+    get the first 50 players per event, which especially hurts smaller
+    regions (LATAM was capped at 64 unique players because the first
+    page of each event group mostly overlapped). Walk pages until one
+    returns fewer than _STATS_PAGE_SIZE_THRESHOLD or we hit the cap.
+
+    Pages are fetched sequentially because we don't know up front how
+    many there are; in practice most events stop after page 1-2 so
+    this is cheap.
+    """
+    all_rows: list = []
+    seen_players = set()
+    for page in range(1, _MAX_PAGES_PER_EVENT + 1):
+        url = _stats_url(event_group_id, region, timespan, page=page)
+        page_rows = await _fetch_one_page(url, client, semaphore)
+        if not page_rows:
+            break
+        # Dedup within this event in case VLR returns overlapping rows
+        # across pages (rare but possible if the table re-orders mid-walk).
+        new_rows = [r for r in page_rows if r["player"] not in seen_players]
+        for r in new_rows:
+            seen_players.add(r["player"])
+        all_rows.extend(new_rows)
+        if len(page_rows) < _STATS_PAGE_SIZE_THRESHOLD:
+            break
+    return all_rows
 
 
 def _to_float(s: str) -> float:
@@ -647,8 +697,9 @@ async def _fetch_all_for_region(
 
     region_for_tier = region_key or region
     semaphore = asyncio.Semaphore(_SEMAPHORE_LIMIT)
-    urls = [_stats_url(eid, region, timespan) for eid, _ in pairs]
-    fetched = await asyncio.gather(*[_fetch_rows(u, client, semaphore) for u in urls])
+    fetched = await asyncio.gather(
+        *[_fetch_rows(eid, region, timespan, client, semaphore) for eid, _ in pairs]
+    )
 
     merged: list = []
     for (eid, name), rows in zip(pairs, fetched):
@@ -673,9 +724,10 @@ async def _fetch_single_all(region: str, timespan: str, client) -> list:
     """Single-shot stats fetch using event_group_id=all. Used as a fallback when
     per-event-group scraping returns nothing or discovery fails. The region
     filter is applied server-side and is reliable for GC; for other regions
-    it tends to leak across regions (which is why we normally avoid it)."""
+    it tends to leak across regions (which is why we normally avoid it).
+    Walks pages like the per-event-group path does."""
     semaphore = asyncio.Semaphore(1)
-    return await _fetch_rows(_stats_url("all", region, timespan), client, semaphore)
+    return await _fetch_rows("all", region, timespan, client, semaphore)
 
 
 @handle_scraper_errors
