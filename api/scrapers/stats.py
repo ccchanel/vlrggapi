@@ -583,30 +583,33 @@ _PERCENT_FIELDS = (
 
 
 def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
-    """Merge two player lists with tier×rounds-weighted aggregation.
+    """Merge two player lists with split-weight aggregation:
 
-    Each event_group_id we scrape returns per-event stats for the
-    players who competed in it. A player with rows in 5 events should
-    show a tier-weighted aggregate that respects which tier the data
-    came from — VCT performance contributes more than VCL, which
-    contributes more than MrFunhaver / Other.
+      - **Stats** (rating, ACS, K/D, ADR, KPR/APR/FKPR/FDPR, HS%,
+        Clutch%, KAST%) use **pure rounds-weighted MEAN**, matching
+        what VLR shows on each player's profile page. This keeps our
+        watchlist + table numbers identical to what users see on
+        vlr.gg, so a 1.03 rating on VLR reads as 1.03 here too.
 
-    `secondary_tier` is the tier weight (0.5–1.0) for the rows we're
-    merging into the running primary. Each row's effective weight in
-    the average is `rounds × tier_weight`. The `_acc_weight` field on
-    each player accumulates the running total for chained merges.
+      - **event_tier** uses **tier×rounds-weighted MEAN**. Cached as
+        the rolling sum of (rounds_i × tier_i) divided by total
+        rounds. The frontend's scout-score multiplier picks this up
+        so tier still factors into ranking — just not into the raw
+        stats display.
+
+    `secondary_tier` is the tier weight (0.5-1.0) of the rows being
+    merged in. `_acc_weight` accumulates rounds × tier across merges
+    purely for the event_tier calc.
 
     Aggregation rules:
       - rounds_played: SUM (real rounds, unweighted)
-      - rating/ACS/K:D/ADR/KPR/APR/FKPR/FDPR: tier×rounds-weighted MEAN
-      - HS%/Clutch%/KAST%: tier×rounds-weighted MEAN
+      - rating/ACS/K:D/ADR/KPR/APR/FKPR/FDPR: rounds-weighted MEAN
+      - HS%/Clutch%/KAST%: rounds-weighted MEAN
       - agents: UNION across events
       - event_tier: rounds-weighted MEAN of the tiers the player
         played in. Used to be MAX (best tier the player ever touched),
         but that inflated qualifier players who briefly cameo'd in a
-        Challengers event to look like full VCL competitors. Mean
-        weighted by rounds correctly down-weights a 200-round Rivals
-        season punctuated by a 20-round Challengers appearance.
+        Challengers event to look like full VCL competitors.
       - org/team_full: first non-empty
     """
     out = list(primary)
@@ -630,36 +633,38 @@ def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
             continue
 
         existing = out[idx]
-        old_w = float(existing.get("_acc_weight", 0.0)) or _to_float(existing.get("rounds_played"))
+        # Stats use pure rounds weighting (matches VLR).
+        old_rounds = _to_float(existing.get("rounds_played"))
         new_rounds = _to_float(r.get("rounds_played"))
-        new_w = new_rounds * secondary_tier
-        total_w = old_w + new_w
-        if total_w <= 0:
+        total_rounds = old_rounds + new_rounds
+        if total_rounds <= 0:
             continue
 
         for f in _WEIGHTED_FIELDS:
             old_v = _to_float(existing.get(f))
             new_v = _to_float(r.get(f))
-            avg = (old_v * old_w + new_v * new_w) / total_w
+            avg = (old_v * old_rounds + new_v * new_rounds) / total_rounds
             existing[f] = f"{avg:.2f}"
 
         for f in _PERCENT_FIELDS:
             old_v = _to_float(existing.get(f))
             new_v = _to_float(r.get(f))
-            avg = (old_v * old_w + new_v * new_w) / total_w
+            avg = (old_v * old_rounds + new_v * new_rounds) / total_rounds
             had_pct = "%" in str(existing.get(f) or "") or "%" in str(r.get(f) or "")
             existing[f] = f"{round(avg)}%" if had_pct else f"{avg:.2f}"
 
-        old_rounds = _to_float(existing.get("rounds_played"))
-        existing["rounds_played"] = str(int(old_rounds + new_rounds))
-        existing["_acc_weight"] = total_w
-        # Weighted-mean tier across all events the player has competed
-        # in. _acc_weight = sum(rounds_i × tier_i); rounds_played = sum
-        # of rounds. Their ratio is the average tier weighted by where
-        # the player actually spent their time.
-        total_rounds_int = int(old_rounds + new_rounds)
+        existing["rounds_played"] = str(int(total_rounds))
+
+        # event_tier still uses tier×rounds weighting — kept independent
+        # of the stat aggregation above so the scout-score multiplier
+        # on the frontend has tier context to multiply with.
+        old_w_tier = float(existing.get("_acc_weight", 0.0)) or old_rounds
+        new_w_tier = new_rounds * secondary_tier
+        total_w_tier = old_w_tier + new_w_tier
+        existing["_acc_weight"] = total_w_tier
+        total_rounds_int = int(total_rounds)
         if total_rounds_int > 0:
-            existing["event_tier"] = round(total_w / total_rounds_int, 2)
+            existing["event_tier"] = round(total_w_tier / total_rounds_int, 2)
 
         agents_old = existing.get("agents") or []
         agents_new = r.get("agents") or []
