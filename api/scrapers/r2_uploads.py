@@ -108,8 +108,12 @@ def mint_upload_url(filename: str, content_type: str, size_bytes: int) -> dict:
     object_key = f"vods/{int(time.time())}-{uuid.uuid4().hex[:6]}-{safe}"
 
     client = _get_client()
-    # 15-minute window — enough for a 10 GB upload at 100 Mbps and
-    # short enough to bound exposure if the URL leaks somehow.
+    # 60-minute window. Old comment claimed 15 min was "enough for 10 GB
+    # at 100 Mbps" but the math is wrong: 10 GB ≈ 13.3 min at 100 Mbps
+    # with zero margin, and most home upload links are 30-50 Mbps. Real
+    # case: 3.88 GB upload 400'd because the URL expired mid-PUT.
+    # Bumping to 60 min gives a typical 30 Mbps connection room for ~13
+    # GB; still short enough that a leaked URL has a small blast radius.
     upload_url = client.generate_presigned_url(
         "put_object",
         Params={
@@ -117,7 +121,7 @@ def mint_upload_url(filename: str, content_type: str, size_bytes: int) -> dict:
             "Key": object_key,
             "ContentType": content_type,
         },
-        ExpiresIn=15 * 60,
+        ExpiresIn=60 * 60,
         HttpMethod="PUT",
     )
 
@@ -125,5 +129,5 @@ def mint_upload_url(filename: str, content_type: str, size_bytes: int) -> dict:
         "upload_url": upload_url,
         "public_url": f"{public_base}/{object_key}",
         "object_key": object_key,
-        "expires_in": 15 * 60,
+        "expires_in": 60 * 60,
     }
