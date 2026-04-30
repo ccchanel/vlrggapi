@@ -512,7 +512,12 @@ def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
       - rating/ACS/K:D/ADR/KPR/APR/FKPR/FDPR: tier×rounds-weighted MEAN
       - HS%/Clutch%/KAST%: tier×rounds-weighted MEAN
       - agents: UNION across events
-      - event_tier: MAX (best tier the player has competed in)
+      - event_tier: rounds-weighted MEAN of the tiers the player
+        played in. Used to be MAX (best tier the player ever touched),
+        but that inflated qualifier players who briefly cameo'd in a
+        Challengers event to look like full VCL competitors. Mean
+        weighted by rounds correctly down-weights a 200-round Rivals
+        season punctuated by a 20-round Challengers appearance.
       - org/team_full: first non-empty
     """
     out = list(primary)
@@ -559,7 +564,13 @@ def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
         old_rounds = _to_float(existing.get("rounds_played"))
         existing["rounds_played"] = str(int(old_rounds + new_rounds))
         existing["_acc_weight"] = total_w
-        existing["event_tier"] = round(max(float(existing.get("event_tier", 0.0)), secondary_tier), 2)
+        # Weighted-mean tier across all events the player has competed
+        # in. _acc_weight = sum(rounds_i × tier_i); rounds_played = sum
+        # of rounds. Their ratio is the average tier weighted by where
+        # the player actually spent their time.
+        total_rounds_int = int(old_rounds + new_rounds)
+        if total_rounds_int > 0:
+            existing["event_tier"] = round(total_w / total_rounds_int, 2)
 
         agents_old = existing.get("agents") or []
         agents_new = r.get("agents") or []
