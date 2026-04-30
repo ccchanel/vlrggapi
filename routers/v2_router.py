@@ -1,8 +1,11 @@
 """
 V2 API router — standardized responses, validation, Pydantic models.
 """
-from fastapi import APIRouter, HTTPException, Query, Request
+import os
+
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -455,6 +458,62 @@ async def v2_team_logos(
         start_background_team_logos_build(region)
 
     return JSONResponse({"status": "building"}, status_code=202)
+
+
+# ── VOD self-host upload pipeline ─────────────────────────────────────
+# Mints a short-lived (15-min) presigned PUT URL pointing at the R2
+# bucket, so admins can upload large video files directly from the
+# browser without the bytes touching Railway. Auth is a shared admin
+# secret (X-Admin-Secret header) — the user pastes it once, browser
+# caches in localStorage, backend env var ADMIN_UPLOAD_SECRET verifies.
+
+class _UploadUrlRequest(BaseModel):
+    filename: str = Field(..., max_length=256)
+    content_type: str = Field(..., max_length=64)
+    size_bytes: int = Field(..., gt=0)
+
+
+@router.post("/vods/upload-url")
+@limiter.limit("30/minute")
+async def v2_vods_upload_url(
+    request: Request,
+    body: _UploadUrlRequest,
+    x_admin_secret: str = Header(default=""),
+):
+    """
+    Admin-only endpoint. Returns a presigned R2 PUT URL for a single
+    object upload. The body of the file does NOT pass through Railway.
+
+    Auth: X-Admin-Secret header must match the ADMIN_UPLOAD_SECRET
+    environment variable. The frontend prompts the admin for this
+    secret on first upload and stashes it in localStorage.
+    """
+    expected = (os.environ.get("ADMIN_UPLOAD_SECRET") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Upload not configured (ADMIN_UPLOAD_SECRET unset).",
+        )
+    if not x_admin_secret or x_admin_secret.strip() != expected:
+        raise HTTPException(status_code=401, detail="Invalid admin secret.")
+
+    try:
+        from api.scrapers.r2_uploads import mint_upload_url
+        result = mint_upload_url(
+            filename=body.filename,
+            content_type=body.content_type,
+            size_bytes=body.size_bytes,
+        )
+    except RuntimeError as exc:
+        # Server misconfig — env vars missing, etc.
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        # Bad input — wrong content-type, oversize, etc.
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to mint URL: {exc}")
+
+    return {"status": "success", "data": result}
 
 
 @router.get("/health", response_model=V2Response)
