@@ -516,6 +516,157 @@ async def v2_vods_upload_url(
     return {"status": "success", "data": result}
 
 
+# ── Multipart upload (files larger than R2's 5 GB single-PUT limit) ─
+
+class _MultipartInitRequest(BaseModel):
+    filename: str = Field(..., max_length=256)
+    content_type: str = Field(..., max_length=64)
+    size_bytes: int = Field(..., gt=0)
+
+
+class _MultipartPartRequest(BaseModel):
+    object_key: str = Field(..., max_length=512)
+    upload_id: str = Field(..., max_length=512)
+    part_number: int = Field(..., gt=0, le=10_000)
+
+
+class _MultipartCompletePart(BaseModel):
+    PartNumber: int = Field(..., gt=0, le=10_000)
+    ETag: str = Field(..., max_length=128)
+
+
+class _MultipartCompleteRequest(BaseModel):
+    object_key: str = Field(..., max_length=512)
+    upload_id: str = Field(..., max_length=512)
+    parts: list[_MultipartCompletePart]
+
+
+class _MultipartAbortRequest(BaseModel):
+    object_key: str = Field(..., max_length=512)
+    upload_id: str = Field(..., max_length=512)
+
+
+def _check_admin(x_admin_secret: str):
+    expected = (os.environ.get("ADMIN_UPLOAD_SECRET") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Upload not configured (ADMIN_UPLOAD_SECRET unset).",
+        )
+    if not x_admin_secret or x_admin_secret.strip() != expected:
+        raise HTTPException(status_code=401, detail="Invalid admin secret.")
+
+
+@router.post("/vods/upload-init")
+@limiter.limit("30/minute")
+async def v2_vods_upload_init(
+    request: Request,
+    body: _MultipartInitRequest,
+    x_admin_secret: str = Header(default=""),
+):
+    """Start a multipart upload for files > R2's 5 GB single-PUT limit.
+
+    Returns the upload_id, object_key, part_size, and num_parts so the
+    client can request a presigned URL for each part and reassemble
+    via /upload-complete when done.
+    """
+    _check_admin(x_admin_secret)
+    try:
+        from api.scrapers.r2_uploads import init_multipart_upload
+        result = init_multipart_upload(
+            filename=body.filename,
+            content_type=body.content_type,
+            size_bytes=body.size_bytes,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to init upload: {exc}")
+    return {"status": "success", "data": result}
+
+
+@router.post("/vods/upload-part")
+@limiter.limit("600/minute")
+async def v2_vods_upload_part(
+    request: Request,
+    body: _MultipartPartRequest,
+    x_admin_secret: str = Header(default=""),
+):
+    """Mint a presigned PUT URL for a single part of an in-progress
+    multipart upload. Rate limit is generous because a 200-part upload
+    needs ~200 of these calls in quick succession."""
+    _check_admin(x_admin_secret)
+    try:
+        from api.scrapers.r2_uploads import mint_part_upload_url
+        result = mint_part_upload_url(
+            object_key=body.object_key,
+            upload_id=body.upload_id,
+            part_number=body.part_number,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to mint part URL: {exc}")
+    return {"status": "success", "data": result}
+
+
+@router.post("/vods/upload-complete")
+@limiter.limit("30/minute")
+async def v2_vods_upload_complete(
+    request: Request,
+    body: _MultipartCompleteRequest,
+    x_admin_secret: str = Header(default=""),
+):
+    """Tell R2 to assemble the uploaded parts into the final object.
+
+    Body parts list must be {PartNumber, ETag} pairs — one per part —
+    in any order; we sort server-side. ETag should be exactly what the
+    PUT response Header returned (the surrounding quotes are added if
+    missing)."""
+    _check_admin(x_admin_secret)
+    try:
+        from api.scrapers.r2_uploads import complete_multipart_upload
+        result = complete_multipart_upload(
+            object_key=body.object_key,
+            upload_id=body.upload_id,
+            parts=[p.model_dump() for p in body.parts],
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to complete upload: {exc}")
+    return {"status": "success", "data": result}
+
+
+@router.post("/vods/upload-abort")
+@limiter.limit("30/minute")
+async def v2_vods_upload_abort(
+    request: Request,
+    body: _MultipartAbortRequest,
+    x_admin_secret: str = Header(default=""),
+):
+    """Abort an in-progress multipart upload. Best-effort — on success
+    R2 cleans up any uploaded parts so they don't accrue storage."""
+    _check_admin(x_admin_secret)
+    try:
+        from api.scrapers.r2_uploads import abort_multipart_upload
+        result = abort_multipart_upload(
+            object_key=body.object_key,
+            upload_id=body.upload_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to abort upload: {exc}")
+    return {"status": "success", "data": result}
+
+
 @router.get("/health", response_model=V2Response)
 async def v2_health():
     """Check API health and runtime readiness."""

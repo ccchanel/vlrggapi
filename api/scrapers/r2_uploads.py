@@ -131,3 +131,161 @@ def mint_upload_url(filename: str, content_type: str, size_bytes: int) -> dict:
         "object_key": object_key,
         "expires_in": 60 * 60,
     }
+
+
+# ── Multipart upload (for files > R2's 5 GB single-PUT limit) ────────
+# R2's PutObject caps a single request at 5 GB. Anything bigger has to
+# be uploaded as multiple parts under one UploadId. We mint presigned
+# URLs for each part PUT so the file body still never touches Railway.
+#
+# Flow:
+#   1. POST /v2/vods/upload-init → returns {upload_id, object_key,
+#      part_size, num_parts, public_url}
+#   2. For part N in 1..num_parts:
+#        POST /v2/vods/upload-part {object_key, upload_id, part_number}
+#          → returns {upload_url}
+#        PUT that URL with the part bytes; capture the ETag header
+#   3. POST /v2/vods/upload-complete {object_key, upload_id, parts}
+#      where parts = [{PartNumber, ETag}, ...]
+#
+# Part-size policy: each part must be ≥5 MiB except the final one, and
+# we have a hard cap of 10,000 parts per upload. Default to 32 MiB
+# parts which covers ~320 GB before bumping into the 10K cap.
+
+_MULTIPART_THRESHOLD = 4 * 1024 * 1024 * 1024  # 4 GiB — R2 single-PUT
+                                                # cap is 5 GB, leaving
+                                                # 1 GB margin so a
+                                                # progress-bar overshoot
+                                                # never trips it
+_DEFAULT_PART_SIZE = 32 * 1024 * 1024           # 32 MiB
+_MIN_PART_SIZE = 5 * 1024 * 1024                # R2/S3 minimum
+_MAX_PARTS = 10_000                              # R2/S3 max parts
+
+
+def should_use_multipart(size_bytes: int) -> bool:
+    return size_bytes >= _MULTIPART_THRESHOLD
+
+
+def init_multipart_upload(filename: str, content_type: str, size_bytes: int) -> dict:
+    """Start a multipart upload and return the metadata the client needs
+    to drive the per-part PUTs."""
+    bucket = os.environ.get("R2_BUCKET", "").strip()
+    public_base = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip("/")
+    if not bucket or not public_base:
+        raise RuntimeError("R2_BUCKET and R2_PUBLIC_URL must be set")
+    if content_type not in _ALLOWED_MIME:
+        raise ValueError(
+            f"Unsupported content type '{content_type}'. Use mp4 / webm / mov / mkv."
+        )
+    if size_bytes <= 0:
+        raise ValueError("size_bytes must be positive")
+    if size_bytes > _MAX_BYTES:
+        raise ValueError(
+            f"File too large ({size_bytes} bytes). Max {_MAX_BYTES // (1024*1024*1024)} GB."
+        )
+
+    # Pick a part size that keeps num_parts under _MAX_PARTS, never goes
+    # below _MIN_PART_SIZE, and defaults to _DEFAULT_PART_SIZE for the
+    # common case.
+    part_size = _DEFAULT_PART_SIZE
+    if size_bytes // part_size > _MAX_PARTS:
+        # Round up to the next MB boundary
+        part_size = max(_MIN_PART_SIZE, ((size_bytes // _MAX_PARTS) + 1024 * 1024 - 1) & ~(1024 * 1024 - 1))
+
+    num_parts = (size_bytes + part_size - 1) // part_size
+
+    safe = _safe_filename(filename)
+    object_key = f"vods/{int(time.time())}-{uuid.uuid4().hex[:6]}-{safe}"
+
+    client = _get_client()
+    resp = client.create_multipart_upload(
+        Bucket=bucket,
+        Key=object_key,
+        ContentType=content_type,
+    )
+
+    return {
+        "upload_id": resp["UploadId"],
+        "object_key": object_key,
+        "public_url": f"{public_base}/{object_key}",
+        "part_size": part_size,
+        "num_parts": num_parts,
+    }
+
+
+def mint_part_upload_url(object_key: str, upload_id: str, part_number: int) -> dict:
+    """Presigned PUT URL for a single part of an in-progress multipart
+    upload. Same 60-min window as the single-PUT path."""
+    bucket = os.environ.get("R2_BUCKET", "").strip()
+    if not bucket:
+        raise RuntimeError("R2_BUCKET must be set")
+    if not object_key or not upload_id:
+        raise ValueError("object_key and upload_id are required")
+    if part_number < 1 or part_number > _MAX_PARTS:
+        raise ValueError(f"part_number must be 1..{_MAX_PARTS}")
+
+    client = _get_client()
+    upload_url = client.generate_presigned_url(
+        "upload_part",
+        Params={
+            "Bucket": bucket,
+            "Key": object_key,
+            "UploadId": upload_id,
+            "PartNumber": part_number,
+        },
+        ExpiresIn=60 * 60,
+        HttpMethod="PUT",
+    )
+    return {"upload_url": upload_url}
+
+
+def complete_multipart_upload(object_key: str, upload_id: str, parts: list) -> dict:
+    """Finalize the multipart upload. `parts` is a list of
+    {PartNumber, ETag} dicts in part-number order."""
+    bucket = os.environ.get("R2_BUCKET", "").strip()
+    public_base = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip("/")
+    if not bucket or not public_base:
+        raise RuntimeError("R2_BUCKET and R2_PUBLIC_URL must be set")
+    if not object_key or not upload_id:
+        raise ValueError("object_key and upload_id are required")
+    if not parts:
+        raise ValueError("parts list is empty")
+
+    # Defensive sort + shape check — boto3 demands ascending PartNumber
+    # and complains noisily if ETags don't include the surrounding quotes
+    # that S3/R2 returns by default.
+    cleaned = []
+    for p in parts:
+        try:
+            n = int(p["PartNumber"])
+            etag = str(p["ETag"]).strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Bad part entry {p}: {exc}")
+        if not etag.startswith('"'):
+            etag = f'"{etag}"'
+        cleaned.append({"PartNumber": n, "ETag": etag})
+    cleaned.sort(key=lambda x: x["PartNumber"])
+
+    client = _get_client()
+    client.complete_multipart_upload(
+        Bucket=bucket,
+        Key=object_key,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": cleaned},
+    )
+    return {"public_url": f"{public_base}/{object_key}"}
+
+
+def abort_multipart_upload(object_key: str, upload_id: str) -> dict:
+    """Best-effort abort so a cancelled upload doesn't leave R2
+    accruing storage for orphaned parts."""
+    bucket = os.environ.get("R2_BUCKET", "").strip()
+    if not bucket:
+        raise RuntimeError("R2_BUCKET must be set")
+    client = _get_client()
+    client.abort_multipart_upload(
+        Bucket=bucket,
+        Key=object_key,
+        UploadId=upload_id,
+    )
+    return {"aborted": True}
