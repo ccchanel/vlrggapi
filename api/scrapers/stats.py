@@ -327,11 +327,20 @@ def _classify_event_tier(name: str, region_key: str) -> float:
     # higher than 'Other'. Match before VCL/VCT keyword checks so
     # 'Challengers Open Qualifier' lands here, not in TIER_VCL.
     if region_key == "eu":
-        # Qualifiers (open + closed). Bare 'qualifier' is matched too
-        # so any community/regional qualifier path gets the lower
-        # weight. The 'last chance qualifier' high-stakes exception
-        # is overridden explicitly below.
-        is_qualifier = "qualifier" in n or "open league" in n
+        # Tier-3 EU circuit: Rivals League + qualifiers + open brackets
+        # + play-ins + any open-circuit / off-season event that isn't
+        # a real VCL stage. Match BEFORE the VCL/VCT keyword checks so
+        # 'VCL EMEA Open Qualifier' / 'Challengers Open Qualifier' /
+        # 'EMEA Open Bracket' all land here, not in TIER_VCL.
+        is_qualifier = (
+            "qualifier" in n
+            or "open league" in n
+            or "open bracket" in n
+            or "open ladder" in n
+            or "play-in" in n
+            or " play in " in f" {n} "
+            or "play-ins" in n
+        )
         is_lcq = "last chance qualifier" in n or "last-chance qualifier" in n
         is_rivals = "rivals" in n
         if (is_qualifier and not is_lcq) or is_rivals:
@@ -345,11 +354,14 @@ def _classify_event_tier(name: str, region_key: str) -> float:
     # tier-2 invitational that mixes Challengers + Partner orgs but is
     # NOT VCT proper. Players like kozzy/Proxh/Lime on Enterprise
     # Esports compete here and should keep their VCL tag.
+    # Note: dropped bare "promotion" because it matched too many open
+    # / community "Promotion Cup" / "Promotion League" events that
+    # shouldn't get the VCL tag. Real T2 promotion events are still
+    # caught by 'vcl' / 'ascension' / 'challengers' substrings.
     if (
         "challengers" in n
         or "vcl" in n
         or "ascension" in n
-        or "promotion" in n
         or "partner series" in n
     ):
         return TIER_VCL
