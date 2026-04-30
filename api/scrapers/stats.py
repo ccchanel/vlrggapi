@@ -235,11 +235,12 @@ TIER_VCT = 1.00          # VCT International League / Masters / Champions
 TIER_VCL = 0.85          # VCL / Challengers / Ascension
 TIER_GC = 0.85           # Game Changers — legit pro circuit, treat ~= VCL
 TIER_FUNHAVER = 0.75     # MrFunhaver tournaments (close to VCL but lower)
-TIER_RIVALS = 0.75       # EU Rivals League / open qualifiers — semi-pro
-                         # circuit one rung below Challengers. Same
-                         # weight as Funhaver; region-disambiguated by
-                         # the frontend so the label reads "RIVALS"
-                         # (EU) vs "FUN" (NA).
+TIER_RIVALS = 0.65       # EU Rivals League / open + closed qualifiers —
+                         # semi-pro circuit one rung below Challengers.
+                         # Lower than Funhaver because the talent pool
+                         # is broader / less curated. Region-
+                         # disambiguated by the frontend so the label
+                         # reads "RIVALS" on EU rows.
 TIER_OTHER = 0.50        # Anything else
 
 
@@ -287,15 +288,14 @@ def _classify_event_tier(name: str, region_key: str) -> float:
     # higher than 'Other'. Match before VCL/VCT keyword checks so
     # 'Challengers Open Qualifier' lands here, not in TIER_VCL.
     if region_key == "eu":
-        is_qualifier = (
-            "open qualifier" in n
-            or "closed qualifier" in n
-            or "open league" in n
-            # Bare 'qualifier' is intentionally NOT matched here — VLR
-            # uses 'Last Chance Qualifier' for high-stakes T1 events.
-        )
+        # Qualifiers (open + closed). Bare 'qualifier' is matched too
+        # so any community/regional qualifier path gets the lower
+        # weight. The 'last chance qualifier' high-stakes exception
+        # is overridden explicitly below.
+        is_qualifier = "qualifier" in n or "open league" in n
+        is_lcq = "last chance qualifier" in n or "last-chance qualifier" in n
         is_rivals = "rivals" in n
-        if is_qualifier or is_rivals:
+        if (is_qualifier and not is_lcq) or is_rivals:
             return TIER_RIVALS
 
     # T2 markers take priority over the "Champions Tour" umbrella.
