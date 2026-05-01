@@ -45,6 +45,26 @@ def recently_failed(region_key: str, timespan: str, exclude_funhaver: bool = Fal
 # For these, an empty result is treated as a failure and NOT cached.
 _MAJOR_REGIONS = {"na", "eu", "ap", "kr", "br", "cn", "jp"}
 
+# Per-region "expected" country bias — the dominant country codes
+# we'd expect in a healthy scrape. If the actual distribution comes
+# back with too few of these (i.e. the scrape leaked into a global
+# unfiltered result), we reject the build and don't cache the trash.
+# Prevents the user from staring at stale "904 mostly-US players"
+# under the China tab when VLR's region filter silently failed.
+_REGION_EXPECTED_COUNTRIES = {
+    "cn": {"cn", "hk", "mo", "tw"},
+    "kr": {"kr"},
+    "jp": {"jp"},
+    "br": {"br"},
+}
+def _region_country_dominance(region_key: str, segments: list) -> float:
+    expected = _REGION_EXPECTED_COUNTRIES.get(region_key)
+    if not expected or not segments:
+        return 1.0
+    matches = sum(1 for s in segments if (s.get("country") or "").lower() in expected)
+    return matches / len(segments)
+
+
 async def _background_build(region_key: str, timespan: str, exclude_funhaver: bool = False):
     key = _job_key(region_key, timespan, exclude_funhaver)
     cargs = _cache_args(region_key, timespan, exclude_funhaver)
@@ -55,6 +75,19 @@ async def _background_build(region_key: str, timespan: str, exclude_funhaver: bo
             timeout=_BUILD_HARD_TIMEOUT,
         )
         segments = (result or {}).get("data", {}).get("segments", [])
+        # Sanity: country-bias check for regions where we KNOW the
+        # dominant country codes. CN was returning 904 mostly-US/TR
+        # players from a leaked filter — if dominance falls below
+        # ~25%, the filter clearly didn't take. Treat as failure.
+        dominance = _region_country_dominance(region_key, segments)
+        if segments and dominance < 0.25:
+            logger.warning(
+                "Region %s returned %d players but only %.0f%% match expected countries — leaked filter, invalidating",
+                key, len(segments), dominance * 100,
+            )
+            cache_manager.invalidate(CACHE_TTL_STATS, *cargs)
+            _failed_builds[key] = time.time()
+            return
         # For MAJOR regions, 0 players is almost certainly a failure
         if not segments and region_key in _MAJOR_REGIONS:
             logger.warning("Major region %s returned 0 players — invalidating cache", key)
