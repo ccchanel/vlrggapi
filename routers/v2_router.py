@@ -674,3 +674,108 @@ async def v2_health():
     return {"status": "success", "data": result}
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Admin: create user via Supabase Service Role key.
+#
+# Frontend's old admin "Invite new user" flow used sb.auth.signUp via
+# the publishable anon key — which means anyone with the publishable
+# key (i.e. anyone visiting the site) could also call signUp. To
+# fully lock down account creation while keeping the admin invite UI
+# functional, the createUser path is moved server-side: this endpoint
+# uses the Supabase Service Role key (Railway env var, never exposed
+# to the frontend) and the existing X-Admin-Secret auth header so
+# only the admin can hit it.
+#
+# Requires Railway env vars:
+#   SUPABASE_URL                 e.g. https://gcqcgnhjsnxrxlpubexk.supabase.co
+#   SUPABASE_SERVICE_ROLE_KEY    Settings → API → service_role
+#
+# After deploying this endpoint, toggle "Allow new users to sign up"
+# OFF in Supabase Auth → Sign In / Providers. The Service Role key
+# bypasses that toggle, so admin invites still work.
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _AdminCreateUserRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=6, max_length=128)
+    email_confirm: bool = Field(default=True)
+    display_name: str | None = Field(default=None, max_length=80)
+
+
+@router.post("/admin/create-user")
+@limiter.limit("10/minute")
+async def v2_admin_create_user(
+    request: Request,
+    body: _AdminCreateUserRequest,
+    x_admin_secret: str = Header(default=""),
+):
+    """Create a Supabase auth user via the Service Role key.
+
+    Replaces the frontend's sb.auth.signUp call so account creation
+    can be locked down at the Supabase level (Allow new users to
+    sign up = OFF) without breaking the admin invite UI.
+
+    Auth: same X-Admin-Secret header used by the VOD upload routes.
+    """
+    _check_admin(x_admin_secret)
+
+    supabase_url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+    service_role = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    if not supabase_url or not service_role:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Admin user creation not configured — set SUPABASE_URL "
+                "and SUPABASE_SERVICE_ROLE_KEY in Railway env."
+            ),
+        )
+
+    payload = {
+        "email": body.email.strip(),
+        "password": body.password,
+        "email_confirm": body.email_confirm,
+    }
+    if body.display_name and body.display_name.strip():
+        payload["user_metadata"] = {"display_name": body.display_name.strip()}
+
+    import httpx as _httpx
+
+    async with _httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(
+                f"{supabase_url}/auth/v1/admin/users",
+                headers={
+                    "apikey": service_role,
+                    "Authorization": f"Bearer {service_role}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        except _httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not reach Supabase auth: {exc}",
+            )
+
+    if resp.status_code >= 400:
+        # Supabase returns a JSON error body — surface its message
+        # so the admin sees "User already registered" / "Invalid
+        # email" / etc. instead of a generic 500.
+        try:
+            err = resp.json()
+            message = err.get("msg") or err.get("error_description") or err.get("error") or resp.text
+        except Exception:
+            message = resp.text or f"Supabase returned {resp.status_code}"
+        raise HTTPException(status_code=resp.status_code, detail=message)
+
+    user_data = resp.json()
+    return {
+        "status": "success",
+        "data": {
+            "user_id": user_data.get("id"),
+            "email": user_data.get("email"),
+            "created_at": user_data.get("created_at"),
+        },
+    }
+
