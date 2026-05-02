@@ -499,6 +499,49 @@ def _is_gc_minor_region(event_name_lower: str) -> bool:
     return False
 
 
+# Map a GC event name to the sub-region a player competing in it
+# should be filed under on the frontend. Lets us tag each player
+# with the region they ACTUALLY play in, instead of relying on
+# their country flag — invert (DE flag) playing NA Stage 1 should
+# appear under NA, not EMEA.
+def _gc_event_region(event_name_lower: str) -> str:
+    n = event_name_lower
+    padded = f" {n} "
+    # Major regions first — these match the frontend GC sub-region buttons
+    if "emea" in n:
+        return "emea"
+    if "north america" in n or " na " in padded or " na:" in n:
+        return "na"
+    if "apac" in n or "pacific" in n:
+        return "apac"
+    if "brazil" in n or "brasil" in n:
+        return "br"
+    # Minor sub-regions — kept granular so frontend can later split
+    # the JP/KR/CN bucket if it wants to.
+    if "latam south" in n or " las " in padded:
+        return "la-s"
+    if "latam north" in n or " lan " in padded:
+        return "la-n"
+    if "latam" in n:
+        return "la"
+    if " kr " in padded or "korea" in n:
+        return "kr"
+    if " jp " in padded or "japan" in n:
+        return "jp"
+    if " cn " in padded or "china" in n or "taiwan" in n or "hong kong" in n:
+        return "cn"
+    if "oceania" in n or " anz " in padded or "australia" in n:
+        return "oce"
+    if "southeast" in n or " sea " in padded:
+        return "sea"
+    if "south asia" in n:
+        return "sa"
+    if "mena" in n or "middle east" in n:
+        return "mena"
+    # Championship / generic year-level events — no specific region.
+    return ""
+
+
 def _classify_event_tier(name: str, region_key: str) -> float:
     """Return a multiplicative weight for stats from this event group.
 
@@ -853,7 +896,12 @@ _PERCENT_FIELDS = (
 )
 
 
-def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
+def _merge(
+    primary: list,
+    secondary: list,
+    secondary_tier: float = 1.0,
+    secondary_event_region: str = "",
+) -> list:
     """Merge two player lists with split-weight aggregation:
 
       - **Stats** (rating, ACS, K/D, ADR, KPR/APR/FKPR/FDPR, HS%,
@@ -903,6 +951,16 @@ def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
             is_vcl_plus = secondary_tier >= TIER_VCL
             r["_vcl_rounds"] = new_rounds if is_vcl_plus else 0
             r["vcl_round_pct"] = 1.0 if is_vcl_plus else 0.0
+            # Track rounds per event region. Final event_region for
+            # the player is the region they played most rounds in —
+            # so a German national whose only GC matches are in NA
+            # Stage 1 ends up filed under NA, not EMEA-by-flag.
+            r["_rounds_by_region"] = {}
+            if secondary_event_region and new_rounds > 0:
+                r["_rounds_by_region"][secondary_event_region] = new_rounds
+                r["event_region"] = secondary_event_region
+            else:
+                r["event_region"] = ""
             out.append(r)
             if pid:
                 by_id[pid] = len(out) - 1
@@ -966,6 +1024,16 @@ def _merge(primary: list, secondary: list, secondary_tier: float = 1.0) -> list:
                 if r.get(f) and r.get(f) not in {"", "N/A"}:
                     existing[f] = r[f]
 
+        # Region-rounds accumulator. event_region = region with the most
+        # rounds played. A player who splits 100 rounds in EMEA Stage 2
+        # and 50 in Cash Cup ends up event_region="emea"; one who plays
+        # only NA Stage 1 (regardless of nationality) is event_region="na".
+        if secondary_event_region and new_rounds > 0:
+            rbr = existing.get("_rounds_by_region") or {}
+            rbr[secondary_event_region] = rbr.get(secondary_event_region, 0) + new_rounds
+            existing["_rounds_by_region"] = rbr
+            existing["event_region"] = max(rbr.items(), key=lambda kv: kv[1])[0]
+
     return out
 
 
@@ -1004,6 +1072,7 @@ async def _fetch_all_for_region(
     for r in merged:
         r.pop("_acc_weight", None)
         r.pop("_vcl_rounds", None)
+        r.pop("_rounds_by_region", None)
     return merged
 
 
@@ -1151,15 +1220,22 @@ async def _fetch_gc_via_subevents(client) -> list:
     )
     merged: list = []
     for (eid, name), rows in zip(subevents, fetched):
+        nl = name.lower()
         tier = _classify_event_tier(name, "gc")
-        merged = _merge(merged, rows, secondary_tier=tier)
+        evt_region = _gc_event_region(nl)
+        merged = _merge(
+            merged, rows,
+            secondary_tier=tier,
+            secondary_event_region=evt_region,
+        )
         logger.debug(
-            "GC sub-event [%s] %r → tier=%.2f, rows=%d",
-            eid, name, tier, len(rows),
+            "GC sub-event [%s] %r → tier=%.2f, region=%r, rows=%d",
+            eid, name, tier, evt_region, len(rows),
         )
     for r in merged:
         r.pop("_acc_weight", None)
         r.pop("_vcl_rounds", None)
+        r.pop("_rounds_by_region", None)
     return merged
 
 
