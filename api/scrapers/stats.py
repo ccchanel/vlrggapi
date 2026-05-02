@@ -1112,50 +1112,76 @@ async def _fetch_single_all(region: str, timespan: str, client) -> list:
 # EMEA Stage 2 main bracket ends up at ≈ 1.00; mixed players land
 # in between based on rounds split.
 async def _discover_gc_subevents(client) -> list[tuple[str, str]]:
-    """Enumerate every individual GC sub-event currently visible on
-    /events. Returns (event_id, event_name) tuples. Filters to events
-    whose name matches the GC umbrella so non-GC events on the same
-    page (VCT regional stages, Challengers, etc.) are dropped.
+    """Enumerate every individual GC sub-event from /events. Walks
+    multiple pages so completed events that ended within the user's
+    timespan window (LizA's EMEA Stage 1 / Kickoff Playoffs / Cash
+    Cup March etc.) are included alongside currently-ongoing ones.
+    Page 1 only catches ongoing/upcoming + a slice of recently-
+    completed; older completed events drift to pages 2+.
+
+    Stops paging early once two consecutive pages yield no NEW GC
+    events — past that point we're scraping ancient history nobody's
+    60d window will reach.
     """
-    resp = await fetch_with_retries(
-        VLR_EVENTS_URL, client=client, timeout=10, max_retries=2
-    )
-    html = HTMLParser(resp.text)
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for a in html.css('a[href^="/event/"]'):
-        href = a.attributes.get("href", "") or ""
-        # /event/{id}/{slug} — pull the numeric id
-        parts = href.strip("/").split("/")
-        if len(parts) < 2 or parts[0] != "event":
-            continue
-        eid = parts[1]
-        if not eid.isdigit() or eid in seen:
-            continue
-        # The visible link text bundles status / prize / dates after
-        # the event name. Cut at the first status keyword so we get a
-        # clean name for the classifier.
-        raw = (a.text() or "").replace("\n", " ").strip()
-        text = " ".join(raw.split())
-        for keyword in (" ongoing", " completed", " upcoming", " tbd"):
-            ki = text.lower().find(keyword)
-            if ki > 0:
-                text = text[:ki].strip()
+    pages_to_walk = 5      # ~250 events total — covers the full
+                           # active GC year on every continent.
+    consecutive_empty = 0
+    for page in range(1, pages_to_walk + 1):
+        url = VLR_EVENTS_URL if page == 1 else f"{VLR_EVENTS_URL}?page={page}"
+        try:
+            resp = await fetch_with_retries(
+                url, client=client, timeout=10, max_retries=2
+            )
+        except Exception as exc:
+            logger.warning("/events page %d fetch failed: %s", page, exc)
+            break
+        html = HTMLParser(resp.text)
+        added_this_page = 0
+        for a in html.css('a[href^="/event/"]'):
+            href = a.attributes.get("href", "") or ""
+            # /event/{id}/{slug} — pull the numeric id
+            parts = href.strip("/").split("/")
+            if len(parts) < 2 or parts[0] != "event":
+                continue
+            eid = parts[1]
+            if not eid.isdigit() or eid in seen:
+                continue
+            # The visible link text bundles status / prize / dates
+            # after the event name. Cut at the first status keyword
+            # so we get a clean name for the classifier.
+            raw = (a.text() or "").replace("\n", " ").strip()
+            text = " ".join(raw.split())
+            for keyword in (" ongoing", " completed", " upcoming", " tbd"):
+                ki = text.lower().find(keyword)
+                if ki > 0:
+                    text = text[:ki].strip()
+                    break
+            if not text:
+                continue
+            nl = text.lower()
+            is_gc = (
+                "game changers" in nl
+                or "gamechangers" in nl.replace(" ", "")
+                or " gc " in f" {nl} "
+                or "vctgc" in nl.replace(" ", "")
+            )
+            if not is_gc:
+                continue
+            out.append((eid, text))
+            seen.add(eid)
+            added_this_page += 1
+        if added_this_page == 0:
+            consecutive_empty += 1
+            if consecutive_empty >= 2:
                 break
-        if not text:
-            continue
-        nl = text.lower()
-        is_gc = (
-            "game changers" in nl
-            or "gamechangers" in nl.replace(" ", "")
-            or " gc " in f" {nl} "
-            or "vctgc" in nl.replace(" ", "")
-        )
-        if not is_gc:
-            continue
-        out.append((eid, text))
-        seen.add(eid)
-    logger.info("Discovered %d GC sub-events from /events", len(out))
+        else:
+            consecutive_empty = 0
+    logger.info(
+        "Discovered %d GC sub-events across %d page(s) of /events",
+        len(out), page,
+    )
     return out
 
 
