@@ -460,24 +460,41 @@ TIER_RIVALS = 0.65       # EU Rivals League / open + closed qualifiers —
 TIER_OTHER = 0.50        # Anything else
 
 
-# GC sub-region detection. Match on the event name (already lowercased
-# by the caller). The four major franchise regions Riot runs full GC
-# leagues for keep TIER_VCT; everything else drops to TIER_GC_MINOR.
-def _is_gc_major_region(event_name_lower: str) -> bool:
+# GC sub-region detection. Inverted logic: GC events default to the
+# main TIER_VCT weight, and we only drop to TIER_GC_MINOR when the
+# event name EXPLICITLY identifies a smaller sub-region (LATAM,
+# Korea, Japan, MENA, etc.). The previous "require major-region
+# keyword to qualify" approach had a fatal blind spot: events like
+# "VCT 2026: Game Changers Championship" or generic "Game Changers"
+# series have no geo token at all and were falling through to
+# TIER_GC_MINOR — so EVERY GC player ended up at event_tier=0.80
+# regardless of whether they competed in the Championship or a
+# regional cash-cup series.
+def _is_gc_minor_region(event_name_lower: str) -> bool:
     n = event_name_lower
     padded = f" {n} "
-    # EMEA — single distinctive token, safe to match anywhere.
-    if "emea" in n:
+    # LATAM (combined + split brackets).
+    if "latam" in n or " lan " in padded or " las " in padded:
         return True
-    # North America. 'NA' as a bare token is dangerous (it appears in
-    # 'mena', 'final', etc.) so require boundary.
-    if "north america" in n or " na " in padded or " na:" in n:
+    # Oceania / ANZ / Australia.
+    if "oceania" in n or " anz " in padded or "australia" in n:
         return True
-    # APAC / Pacific.
-    if "apac" in n or "pacific" in n:
+    # MENA / Middle East.
+    if "mena" in n or "middle east" in n:
         return True
-    # Brazil (English + Portuguese spelling).
-    if "brazil" in n or "brasil" in n:
+    # Korea / Japan.
+    if " kr " in padded or "korea" in n:
+        return True
+    if " jp " in padded or "japan" in n:
+        return True
+    # Generic asia bucket (excludes apac which is treated as major).
+    if "asia" in n and "apac" not in n:
+        return True
+    # SEA / Southeast Asia (sub-region of APAC umbrella when split).
+    if " sea " in padded or "southeast" in n:
+        return True
+    # China / Taiwan / Hong Kong sub-leagues.
+    if " cn " in padded or "china" in n or "taiwan" in n or "hong kong" in n:
         return True
     return False
 
@@ -555,7 +572,7 @@ def _classify_event_tier(name: str, region_key: str) -> float:
         # The match is on the EVENT name, so it reflects which
         # league the team competed in (not where the player is from).
         if region_key == "gc":
-            return TIER_VCT if _is_gc_major_region(n) else TIER_GC_MINOR
+            return TIER_GC_MINOR if _is_gc_minor_region(n) else TIER_VCT
         # In other regions a stray GC event would still represent
         # T2-equivalent skill (TIER_VCL).
         return TIER_VCL
