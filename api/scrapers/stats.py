@@ -99,6 +99,15 @@ async def _background_build(region_key: str, timespan: str, exclude_funhaver: bo
         else:
             _failed_builds.pop(key, None)
             logger.info("Background stats build complete: %s (%d players)", key, len(segments))
+            # Post-scrape QA pass — scan for players with missing
+            # critical fields (country, top agents, org tag) and try
+            # to repair via per-player profile fetches. Runs in the
+            # same task so the patched cache is in place before any
+            # frontend re-fetch happens. Capped to avoid runaway cost.
+            try:
+                await _post_scrape_qa(region_key, timespan, exclude_funhaver, result, cargs)
+            except Exception as exc:
+                logger.warning("[qa] %s: post-scrape QA pass failed (non-fatal): %s", key, exc)
     except asyncio.TimeoutError:
         logger.error("Background stats build TIMED OUT after %ds: %s", _BUILD_HARD_TIMEOUT, key)
         try:
@@ -111,6 +120,151 @@ async def _background_build(region_key: str, timespan: str, exclude_funhaver: bo
         _failed_builds[key] = time.time()
     finally:
         _building.discard(key)
+
+async def _post_scrape_qa(region_key: str, timespan: str, exclude_funhaver: bool,
+                          payload: dict, cargs: tuple):
+    """Review a freshly-cached scrape, identify players with missing
+    fields, and try to fill the gaps via per-player profile lookups.
+
+    Anomalies we can repair (player_id required for profile lookup):
+      · empty `country`         → /v2/player → country
+      · empty `agents` list     → /v2/player → agent_stats top 3
+      · empty / "N/A" `org`     → /v2/player → current_team.tag
+
+    Anomalies we can't auto-repair (logged only):
+      · empty `player_id`       (no profile to look up)
+      · zero `rating` while rounds_played > 0  (parse miss; the profile
+        endpoint doesn't carry per-timespan stats we'd need to backfill)
+
+    Capped at MAX_REPAIRS per pass to avoid blasting VLR with hundreds
+    of profile fetches if a scrape comes back wholesale broken — the
+    real fix in that case is a re-scrape, not a profile-by-profile
+    bandage.
+    """
+    segments = (payload or {}).get("data", {}).get("segments") or []
+    if not segments:
+        return
+
+    key = _job_key(region_key, timespan, exclude_funhaver)
+    repair_targets: list[tuple[int, str, list[str]]] = []
+    unrepairable_no_id = 0
+    unrepairable_zero_rating = 0
+    for idx, seg in enumerate(segments):
+        pid = (seg.get("player_id") or "").strip()
+        # Track-only signals that we can't fix from /v2/player.
+        try:
+            rounds = int(seg.get("rounds_played") or 0)
+        except (TypeError, ValueError):
+            rounds = 0
+        try:
+            rating = float(seg.get("rating") or 0)
+        except (TypeError, ValueError):
+            rating = 0.0
+        if not pid:
+            unrepairable_no_id += 1
+            continue
+        if rating == 0 and rounds > 0:
+            unrepairable_zero_rating += 1
+        # Repairable signals.
+        missing: list[str] = []
+        if not (seg.get("country") or "").strip():
+            missing.append("country")
+        if not seg.get("agents") and rounds > 0:
+            missing.append("agents")
+        if (seg.get("org") or "").strip() in ("", "N/A"):
+            missing.append("org")
+        if missing:
+            repair_targets.append((idx, pid, missing))
+
+    if unrepairable_no_id or unrepairable_zero_rating:
+        logger.info(
+            "[qa] %s: %d segments without player_id (unrepairable), %d with zero rating + non-zero rounds (unrepairable)",
+            key, unrepairable_no_id, unrepairable_zero_rating,
+        )
+
+    if not repair_targets:
+        logger.info("[qa] %s: clean scan, %d segments, no missing fields", key, len(segments))
+        return
+
+    MAX_REPAIRS = 30
+    overflow = max(0, len(repair_targets) - MAX_REPAIRS)
+    repair_targets = repair_targets[:MAX_REPAIRS]
+    if overflow:
+        logger.warning(
+            "[qa] %s: %d players have missing fields — capping repair pass at %d (consider a re-scrape)",
+            key, len(repair_targets) + overflow, MAX_REPAIRS,
+        )
+    else:
+        logger.info("[qa] %s: attempting to repair %d players with missing fields", key, len(repair_targets))
+
+    # Late import — avoids the circular import at module load time.
+    from .players import vlr_player
+
+    semaphore = asyncio.Semaphore(4)  # gentler than the main scrape
+    PROFILE_TIMEOUT = 15
+
+    async def repair_one(idx: int, pid: str, missing: list[str]):
+        async with semaphore:
+            try:
+                profile = await asyncio.wait_for(vlr_player(pid), timeout=PROFILE_TIMEOUT)
+            except Exception as exc:
+                logger.debug("[qa] %s: vlr_player(%s) failed: %s", key, pid, exc)
+                return idx, None, missing
+            profile_segs = (profile or {}).get("data", {}).get("segments") or []
+            if not profile_segs:
+                return idx, None, missing
+            p = profile_segs[0]
+            patch: dict = {}
+            if "country" in missing:
+                c = (p.get("country") or "").strip().lower()
+                if c:
+                    patch["country"] = c
+            if "agents" in missing:
+                agents: list[str] = []
+                for a in (p.get("agent_stats") or [])[:3]:
+                    name = a.get("agent") if isinstance(a, dict) else None
+                    if name:
+                        agents.append(name)
+                if agents:
+                    patch["agents"] = agents
+            if "org" in missing:
+                ct = p.get("current_team") or {}
+                tag = (ct.get("tag") or "").strip()
+                if tag:
+                    patch["org"] = tag
+            return idx, patch or None, missing
+
+    results = await asyncio.gather(*(repair_one(i, p, m) for (i, p, m) in repair_targets))
+    repaired_count = 0
+    field_counts = {"country": 0, "agents": 0, "org": 0}
+    for idx, patch, missing in results:
+        if not patch:
+            continue
+        seg = segments[idx]
+        for k_, v in patch.items():
+            seg[k_] = v
+            field_counts[k_] = field_counts.get(k_, 0) + 1
+        repaired_count += 1
+
+    if repaired_count:
+        # Re-cache the patched payload so subsequent reads see the fix.
+        # In-place mutation already updated the cached envelope (lists
+        # and dicts are passed by reference) but call set() explicitly
+        # to bump the cache's TTL anchor and survive any backend that
+        # treats cache values as immutable.
+        try:
+            cache_manager.set(CACHE_TTL_STATS, payload, *cargs)
+        except Exception as exc:
+            logger.debug("[qa] %s: re-cache failed (mutation already applied): %s", key, exc)
+        logger.info(
+            "[qa] %s: repaired %d/%d players (country=%d agents=%d org=%d)",
+            key, repaired_count, len(repair_targets),
+            field_counts["country"], field_counts["agents"], field_counts["org"],
+        )
+    else:
+        logger.info("[qa] %s: 0 repairs applied (all %d profile lookups failed or yielded no fix)",
+                    key, len(repair_targets))
+
 
 def start_background_build(region_key: str, timespan: str, exclude_funhaver: bool = False) -> bool:
     """Fire a background scrape task. Returns False if one is already running."""
