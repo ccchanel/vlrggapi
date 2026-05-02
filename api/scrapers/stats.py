@@ -99,15 +99,17 @@ async def _background_build(region_key: str, timespan: str, exclude_funhaver: bo
         else:
             _failed_builds.pop(key, None)
             logger.info("Background stats build complete: %s (%d players)", key, len(segments))
-            # Post-scrape QA pass — scan for players with missing
-            # critical fields (country, top agents, org tag) and try
-            # to repair via per-player profile fetches. Runs in the
-            # same task so the patched cache is in place before any
-            # frontend re-fetch happens. Capped to avoid runaway cost.
-            try:
-                await _post_scrape_qa(region_key, timespan, exclude_funhaver, result, cargs)
-            except Exception as exc:
-                logger.warning("[qa] %s: post-scrape QA pass failed (non-fatal): %s", key, exc)
+            # Post-scrape QA pass — fire-and-forget so the public
+            # endpoint flips from 202 → 200 the moment the actual
+            # scrape data is in cache. Without this, QA's up-to-30
+            # profile fetches would keep the _building flag set for
+            # another ~60-120s after the data is already available,
+            # and the frontend's poll loop would time out before
+            # seeing the cached payload (this was the "365d shows
+            # 0 players" symptom).
+            asyncio.create_task(_post_scrape_qa_safe(
+                region_key, timespan, exclude_funhaver, result, cargs
+            ))
     except asyncio.TimeoutError:
         logger.error("Background stats build TIMED OUT after %ds: %s", _BUILD_HARD_TIMEOUT, key)
         try:
@@ -120,6 +122,25 @@ async def _background_build(region_key: str, timespan: str, exclude_funhaver: bo
         _failed_builds[key] = time.time()
     finally:
         _building.discard(key)
+
+async def _post_scrape_qa_safe(region_key: str, timespan: str, exclude_funhaver: bool,
+                                payload: dict, cargs: tuple):
+    """Wrapper that swallows exceptions + enforces a hard wall-clock
+    cap on the QA pass. Fire-and-forget detached from _background_build,
+    so a stuck profile fetch can't keep the public endpoint returning
+    202 indefinitely."""
+    QA_HARD_TIMEOUT = 120.0
+    key = _job_key(region_key, timespan, exclude_funhaver)
+    try:
+        await asyncio.wait_for(
+            _post_scrape_qa(region_key, timespan, exclude_funhaver, payload, cargs),
+            timeout=QA_HARD_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[qa] %s: timed out after %.0fs (non-fatal — main scrape data is already cached)", key, QA_HARD_TIMEOUT)
+    except Exception as exc:
+        logger.warning("[qa] %s: post-scrape QA pass failed (non-fatal): %s", key, exc)
+
 
 async def _post_scrape_qa(region_key: str, timespan: str, exclude_funhaver: bool,
                           payload: dict, cargs: tuple):
