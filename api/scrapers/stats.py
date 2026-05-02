@@ -5,7 +5,7 @@ import time
 from selectolax.parser import HTMLParser
 
 from utils.http_client import fetch_with_retries, get_http_client
-from utils.constants import VLR_STATS_URL, CACHE_TTL_STATS
+from utils.constants import VLR_BASE_URL, VLR_STATS_URL, VLR_EVENTS_URL, CACHE_TTL_STATS
 from utils.cache_manager import cache_manager
 from utils.error_handling import handle_scraper_errors, validate_region, validate_timespan
 from utils.html_parsers import extract_text_content
@@ -1026,6 +1026,143 @@ async def _fetch_single_all(region: str, timespan: str, client) -> list:
     return await _fetch_rows("all", region, timespan, client, semaphore)
 
 
+# ── PER-SUB-EVENT SCRAPING (GC) ───────────────────────────────────────
+# VLR's /stats endpoint only filters at the YEAR-level event group
+# ("Valorant Game Changers 2026"), which lumps Stage 1 / Stage 2 /
+# P/R / PQ / Cash Cup / Championship into a single per-player row
+# with rounds/rating/acs/kd already mashed across every sub-event.
+# That made per-sub-event tier classification impossible — the
+# classifier saw one umbrella name and applied one tier to the
+# already-aggregated lump.
+#
+# Solution: scrape each individual sub-event via /event/stats/{event_id}
+# (same HTML shape as /stats so _parse_stats_row works unchanged),
+# classify each sub-event by its own name, and let _merge do the
+# rounds × tier weighting per player. A player who only competed in
+# P/R + Cash Cup ends up with event_tier ≈ 0.50; a player who played
+# EMEA Stage 2 main bracket ends up at ≈ 1.00; mixed players land
+# in between based on rounds split.
+async def _discover_gc_subevents(client) -> list[tuple[str, str]]:
+    """Enumerate every individual GC sub-event currently visible on
+    /events. Returns (event_id, event_name) tuples. Filters to events
+    whose name matches the GC umbrella so non-GC events on the same
+    page (VCT regional stages, Challengers, etc.) are dropped.
+    """
+    resp = await fetch_with_retries(
+        VLR_EVENTS_URL, client=client, timeout=10, max_retries=2
+    )
+    html = HTMLParser(resp.text)
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for a in html.css('a[href^="/event/"]'):
+        href = a.attributes.get("href", "") or ""
+        # /event/{id}/{slug} — pull the numeric id
+        parts = href.strip("/").split("/")
+        if len(parts) < 2 or parts[0] != "event":
+            continue
+        eid = parts[1]
+        if not eid.isdigit() or eid in seen:
+            continue
+        # The visible link text bundles status / prize / dates after
+        # the event name. Cut at the first status keyword so we get a
+        # clean name for the classifier.
+        raw = (a.text() or "").replace("\n", " ").strip()
+        text = " ".join(raw.split())
+        for keyword in (" ongoing", " completed", " upcoming", " tbd"):
+            ki = text.lower().find(keyword)
+            if ki > 0:
+                text = text[:ki].strip()
+                break
+        if not text:
+            continue
+        nl = text.lower()
+        is_gc = (
+            "game changers" in nl
+            or "gamechangers" in nl.replace(" ", "")
+            or " gc " in f" {nl} "
+            or "vctgc" in nl.replace(" ", "")
+        )
+        if not is_gc:
+            continue
+        out.append((eid, text))
+        seen.add(eid)
+    logger.info("Discovered %d GC sub-events from /events", len(out))
+    return out
+
+
+def _event_stats_url(event_id: str) -> str:
+    """Stats-page URL for a single sub-event. region=all keeps every
+    player who appeared in the event regardless of nationality (the
+    region filter on /event/stats works the same way as on /stats)."""
+    return f"{VLR_BASE_URL}/event/stats/{event_id}/?region=all"
+
+
+async def _fetch_event_rows(
+    event_id: str, client, semaphore: asyncio.Semaphore
+) -> list:
+    """Scrape player rows from a single /event/stats/{id} page. Same
+    HTML structure as /stats (tbody tr + td.mod-player + td.mod-agents),
+    so _parse_stats_row works unchanged. No pagination — VLR shows the
+    full event roster on one page."""
+    url = _event_stats_url(event_id)
+    async with semaphore:
+        for attempt in range(3):
+            try:
+                resp = await fetch_with_retries(
+                    url, client=client, timeout=15, max_retries=1
+                )
+                if resp.status_code != 200:
+                    if attempt < 2:
+                        await asyncio.sleep(0.4)
+                        continue
+                    return []
+                html = HTMLParser(resp.text)
+                rows: list = []
+                for item in html.css("tbody tr"):
+                    parsed = _parse_stats_row(item)
+                    if parsed["player"]:
+                        rows.append(parsed)
+                if rows or attempt >= 2:
+                    return rows
+                await asyncio.sleep(0.4)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch event-stats %s (attempt %d): %s",
+                    url, attempt + 1, exc,
+                )
+                if attempt >= 2:
+                    return []
+                await asyncio.sleep(0.5)
+        return []
+
+
+async def _fetch_gc_via_subevents(client) -> list:
+    """Replacement for the GC year-level scrape. Walks every discovered
+    sub-event individually so each one carries its own tier into the
+    rounds-weighted aggregation. Returns merged player rows with a
+    correct per-player event_tier reflecting the sub-event mix the
+    player actually competed in."""
+    subevents = await _discover_gc_subevents(client)
+    if not subevents:
+        return []
+    semaphore = asyncio.Semaphore(_SEMAPHORE_LIMIT)
+    fetched = await asyncio.gather(
+        *[_fetch_event_rows(eid, client, semaphore) for eid, _ in subevents]
+    )
+    merged: list = []
+    for (eid, name), rows in zip(subevents, fetched):
+        tier = _classify_event_tier(name, "gc")
+        merged = _merge(merged, rows, secondary_tier=tier)
+        logger.debug(
+            "GC sub-event [%s] %r → tier=%.2f, rows=%d",
+            eid, name, tier, len(rows),
+        )
+    for r in merged:
+        r.pop("_acc_weight", None)
+        r.pop("_vcl_rounds", None)
+    return merged
+
+
 @handle_scraper_errors
 async def vlr_stats(region_key: str, timespan: str, exclude_funhaver: bool = False):
     async def build():
@@ -1047,7 +1184,14 @@ async def vlr_stats(region_key: str, timespan: str, exclude_funhaver: bool = Fal
             open_ids = list(open_ids) + list(funhaver_ids)
 
         if region_key == "gc":
-            rows = await _fetch_all_for_region("gc", timespan, gc_ids, client, region_key="gc") if gc_ids else []
+            # Per-sub-event scrape so each sub-event (Stage 1 EMEA, P/R,
+            # Cash Cup, Championship, etc.) gets its own tier weight.
+            # Year-level event-group scrape is the fallback path when
+            # /events discovery returns nothing.
+            rows = await _fetch_gc_via_subevents(client)
+            if not rows:
+                logger.warning("GC sub-event scrape returned 0 rows — falling back to year-level")
+                rows = await _fetch_all_for_region("gc", timespan, gc_ids, client, region_key="gc") if gc_ids else []
             if not rows:
                 rows = await _fetch_single_all("gc", timespan, client)
             if not rows and (open_ids or gc_ids):
