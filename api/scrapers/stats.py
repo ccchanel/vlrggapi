@@ -493,6 +493,40 @@ def _classify_event_tier(name: str, region_key: str) -> float:
         return TIER_OTHER
     n = name.lower()
 
+    # Promotion / Relegation matches are qualifier-tier no matter what
+    # main league they belong to. A team playing GC EMEA Stage 1
+    # Promo/Relegation isn't competing at the main GC EMEA level —
+    # they're trying to climb back in. Treat as TIER_OTHER (0.50)
+    # so stats from those matches don't inflate to main-league weight.
+    # Caught BEFORE the GC / VCT / VCL classifiers so the decoration
+    # in the event name doesn't promote to a higher tier.
+    if (
+        "promotion/relegation" in n
+        or "promotion / relegation" in n
+        or "promo/relegation" in n
+        or "promotion-relegation" in n
+        or "promotion league" in n.replace("/", " ")  # "Promotion League"
+        or "relegation" in n
+    ):
+        return TIER_OTHER
+
+    # PQ / "Pro Qualifier" / "Pro Q" / "Open Qualifier" tournaments —
+    # tier-3 side competitions running alongside the main league. User
+    # flagged FOKUS Sakura's "PQ 2026: Split 2" matches as inflating
+    # their roster's stats; same demotion as Promo/Relegation.
+    # Match BEFORE the GC / VCT / VCL classifiers.
+    if (
+        n.startswith("pq ")
+        or n.startswith("pq:")
+        or " pq " in f" {n} "
+        or "pro qualifier" in n
+        or "pro q " in f" {n} "
+        or "pro-q " in f" {n} "
+        or "open qualifier" in n
+        or "open quals" in n
+    ):
+        return TIER_OTHER
+
     # Game Changers — Riot's professional women's circuit. The main GC
     # league/stages ARE the top of their region (it's a self-contained
     # circuit with one championship), so for the gc region they weight
