@@ -961,6 +961,24 @@ def _merge(
                 r["event_region"] = secondary_event_region
             else:
                 r["event_region"] = ""
+            # Parallel main-event-only stats. Frontend uses these for
+            # the skill grade so a player who plays both main bracket
+            # and cash cups (star FKS.S, etc.) gets graded on their
+            # main-bracket production specifically — NOT their inflated
+            # cash-cup stats dragged through a tier penalty. Threshold
+            # is event_tier ≥ 0.85 = "main-bracket" (real Stage 1/2/
+            # Championship/Kickoff, no Cash Cup / P/R / PQ).
+            is_main = secondary_tier >= 0.85
+            if is_main:
+                r["main_rounds_played"] = str(int(new_rounds))
+                for f in _WEIGHTED_FIELDS:
+                    r[f"main_{f}"] = r.get(f, "0") or "0"
+                for f in _PERCENT_FIELDS:
+                    r[f"main_{f}"] = r.get(f, "0") or "0"
+            else:
+                r["main_rounds_played"] = "0"
+                for f in _WEIGHTED_FIELDS + _PERCENT_FIELDS:
+                    r[f"main_{f}"] = "0"
             out.append(r)
             if pid:
                 by_id[pid] = len(out) - 1
@@ -1033,6 +1051,33 @@ def _merge(
             rbr[secondary_event_region] = rbr.get(secondary_event_region, 0) + new_rounds
             existing["_rounds_by_region"] = rbr
             existing["event_region"] = max(rbr.items(), key=lambda kv: kv[1])[0]
+
+        # Main-event-only aggregation. Same rounds-weighted mean as the
+        # primary aggregate, but only counts contributions from sub-events
+        # at TIER_VCT-equivalent weight (>= 0.85: real Stage / Champs /
+        # Kickoff). Cash Cup / P/R / PQ stats never enter main_* fields,
+        # so the frontend can grade a player on their main-bracket
+        # production alone — star's main-event 1.10 rating, not her
+        # cash-cup-padded 1.30 aggregate.
+        if secondary_tier >= 0.85 and new_rounds > 0:
+            old_main_rounds = _to_float(existing.get("main_rounds_played", 0))
+            total_main_rounds = old_main_rounds + new_rounds
+            for f in _WEIGHTED_FIELDS:
+                main_f = f"main_{f}"
+                old_v = _to_float(existing.get(main_f, 0))
+                new_v = _to_float(r.get(f))
+                if total_main_rounds > 0:
+                    avg = (old_v * old_main_rounds + new_v * new_rounds) / total_main_rounds
+                    existing[main_f] = f"{avg:.2f}"
+            for f in _PERCENT_FIELDS:
+                main_f = f"main_{f}"
+                old_v = _to_float(existing.get(main_f, 0))
+                new_v = _to_float(r.get(f))
+                if total_main_rounds > 0:
+                    avg = (old_v * old_main_rounds + new_v * new_rounds) / total_main_rounds
+                    had_pct = "%" in str(existing.get(main_f) or "") or "%" in str(r.get(f) or "")
+                    existing[main_f] = f"{round(avg)}%" if had_pct else f"{avg:.2f}"
+            existing["main_rounds_played"] = str(int(total_main_rounds))
 
     return out
 
