@@ -1349,13 +1349,16 @@ async def _fetch_event_standings(event_id: str, client) -> dict:
         return {}
     html = HTMLParser(resp.text)
 
-    # 1) Parse Prize Distribution table → team_name (uppercase) → placement
+    # 1) Parse Prize Distribution → team_name (uppercase) → placement
+    # VLR uses a div-grid (`<div class="wf-ptable wf-ptable--standings"
+    # role="table">`) with `.row` and `.cell` children, not real
+    # <table>/<tr>/<td>. Layout: Place | Prize | Team | Note (4 cols).
     team_to_placement: dict = {}
-    table = html.css_first("table.wf-ptable--standings")
+    table = html.css_first(".wf-ptable--standings")
     if table:
         import re as _re
-        for row in table.css("tr"):
-            cells = row.css("td")
+        for row in table.css(".row"):
+            cells = row.css(".cell")
             if len(cells) < 3:
                 continue
             place_text = (cells[0].text(strip=True) or "")
@@ -1363,6 +1366,8 @@ async def _fetch_event_standings(event_id: str, client) -> dict:
             if not m:
                 continue
             placement = int(m.group(1))
+            # Team cell at index 2. Prefer the <a href=/team/...> link
+            # text (clean team name without country/region trailer).
             team_link = cells[2].css_first("a[href*='/team/']")
             team_name = ""
             if team_link:
