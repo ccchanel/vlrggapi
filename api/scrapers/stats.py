@@ -901,6 +901,7 @@ def _merge(
     secondary: list,
     secondary_tier: float = 1.0,
     secondary_event_region: str = "",
+    secondary_is_ongoing: bool = True,
 ) -> list:
     """Merge two player lists with split-weight aggregation:
 
@@ -965,10 +966,15 @@ def _merge(
             # the skill grade so a player who plays both main bracket
             # and cash cups (star FKS.S, etc.) gets graded on their
             # main-bracket production specifically — NOT their inflated
-            # cash-cup stats dragged through a tier penalty. Threshold
-            # is event_tier ≥ 0.85 = "main-bracket" (real Stage 1/2/
-            # Championship/Kickoff, no Cash Cup / P/R / PQ).
-            is_main = secondary_tier >= 0.85
+            # cash-cup stats dragged through a tier penalty. Gates:
+            #   · event_tier ≥ 0.85 = "main-bracket" (real Stage /
+            #     Championship / Kickoff, no Cash Cup / P/R / PQ)
+            #   · is_ongoing = the event is CURRENT (Stage 2 right now,
+            #     not Stage 1 from earlier this year). A player who
+            #     washed out of Stage 1 and isn't on a Stage 2 roster
+            #     shouldn't keep top-of-leaderboard skill grade off
+            #     historical Stage 1 stats.
+            is_main = secondary_tier >= 0.85 and secondary_is_ongoing
             if is_main:
                 r["main_rounds_played"] = str(int(new_rounds))
                 for f in _WEIGHTED_FIELDS:
@@ -1055,11 +1061,11 @@ def _merge(
         # Main-event-only aggregation. Same rounds-weighted mean as the
         # primary aggregate, but only counts contributions from sub-events
         # at TIER_VCT-equivalent weight (>= 0.85: real Stage / Champs /
-        # Kickoff). Cash Cup / P/R / PQ stats never enter main_* fields,
-        # so the frontend can grade a player on their main-bracket
-        # production alone — star's main-event 1.10 rating, not her
-        # cash-cup-padded 1.30 aggregate.
-        if secondary_tier >= 0.85 and new_rounds > 0:
+        # Kickoff) AND currently ongoing (Stage 2 EMEA in May 2026, NOT
+        # ex-Stage 1 stats from earlier this year). A player who washed
+        # out of Stage 1 keeps her aggregate stats for display but loses
+        # main-event credit for grading purposes.
+        if secondary_tier >= 0.85 and secondary_is_ongoing and new_rounds > 0:
             old_main_rounds = _to_float(existing.get("main_rounds_played", 0))
             total_main_rounds = old_main_rounds + new_rounds
             for f in _WEIGHTED_FIELDS:
@@ -1156,7 +1162,7 @@ async def _fetch_single_all(region: str, timespan: str, client) -> list:
 # P/R + Cash Cup ends up with event_tier ≈ 0.50; a player who played
 # EMEA Stage 2 main bracket ends up at ≈ 1.00; mixed players land
 # in between based on rounds split.
-async def _discover_gc_subevents(client) -> list[tuple[str, str]]:
+async def _discover_gc_subevents(client) -> list[tuple[str, str, bool]]:
     """Enumerate every individual GC sub-event from /events. Walks
     multiple pages so completed events that ended within the user's
     timespan window (LizA's EMEA Stage 1 / Kickoff Playoffs / Cash
@@ -1164,11 +1170,18 @@ async def _discover_gc_subevents(client) -> list[tuple[str, str]]:
     Page 1 only catches ongoing/upcoming + a slice of recently-
     completed; older completed events drift to pages 2+.
 
+    Returns (event_id, event_name, is_ongoing) tuples. is_ongoing
+    distinguishes the CURRENT main bracket (Stage 2 EMEA, NA Stage 1
+    in May 2026, etc.) from past stages. The frontend uses ongoing-
+    only main rounds for skill grading so a player who washed out of
+    EMEA Stage 1 doesn't keep a top-of-leaderboard skill grade just
+    because they have historical Stage 1 stats.
+
     Stops paging early once two consecutive pages yield no NEW GC
     events — past that point we're scraping ancient history nobody's
     60d window will reach.
     """
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, bool]] = []
     seen: set[str] = set()
     pages_to_walk = 5      # ~250 events total — covers the full
                            # active GC year on every continent.
@@ -1194,12 +1207,14 @@ async def _discover_gc_subevents(client) -> list[tuple[str, str]]:
             if not eid.isdigit() or eid in seen:
                 continue
             # The visible link text bundles status / prize / dates
-            # after the event name. Cut at the first status keyword
-            # so we get a clean name for the classifier.
+            # after the event name. Detect status keyword first
+            # (used to flag is_ongoing), then cut to clean name.
             raw = (a.text() or "").replace("\n", " ").strip()
             text = " ".join(raw.split())
+            text_lower = text.lower()
+            is_ongoing = "ongoing" in text_lower or "upcoming" in text_lower
             for keyword in (" ongoing", " completed", " upcoming", " tbd"):
-                ki = text.lower().find(keyword)
+                ki = text_lower.find(keyword)
                 if ki > 0:
                     text = text[:ki].strip()
                     break
@@ -1214,7 +1229,7 @@ async def _discover_gc_subevents(client) -> list[tuple[str, str]]:
             )
             if not is_gc:
                 continue
-            out.append((eid, text))
+            out.append((eid, text, is_ongoing))
             seen.add(eid)
             added_this_page += 1
         if added_this_page == 0:
@@ -1224,8 +1239,8 @@ async def _discover_gc_subevents(client) -> list[tuple[str, str]]:
         else:
             consecutive_empty = 0
     logger.info(
-        "Discovered %d GC sub-events across %d page(s) of /events",
-        len(out), page,
+        "Discovered %d GC sub-events (%d ongoing) across %d page(s) of /events",
+        len(out), sum(1 for _, _, ok in out if ok), page,
     )
     return out
 
@@ -1287,10 +1302,10 @@ async def _fetch_gc_via_subevents(client) -> list:
         return []
     semaphore = asyncio.Semaphore(_SEMAPHORE_LIMIT)
     fetched = await asyncio.gather(
-        *[_fetch_event_rows(eid, client, semaphore) for eid, _ in subevents]
+        *[_fetch_event_rows(eid, client, semaphore) for eid, _, _ in subevents]
     )
     merged: list = []
-    for (eid, name), rows in zip(subevents, fetched):
+    for (eid, name, is_ongoing), rows in zip(subevents, fetched):
         nl = name.lower()
         tier = _classify_event_tier(name, "gc")
         evt_region = _gc_event_region(nl)
@@ -1298,10 +1313,11 @@ async def _fetch_gc_via_subevents(client) -> list:
             merged, rows,
             secondary_tier=tier,
             secondary_event_region=evt_region,
+            secondary_is_ongoing=is_ongoing,
         )
         logger.debug(
-            "GC sub-event [%s] %r → tier=%.2f, region=%r, rows=%d",
-            eid, name, tier, evt_region, len(rows),
+            "GC sub-event [%s] %r → tier=%.2f, region=%r, ongoing=%s, rows=%d",
+            eid, name, tier, evt_region, is_ongoing, len(rows),
         )
     for r in merged:
         r.pop("_acc_weight", None)
