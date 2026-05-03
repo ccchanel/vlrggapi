@@ -1327,6 +1327,11 @@ async def _fetch_event_rows(
         return []
 
 
+# Standings change rarely (only when an event finalizes), so cache
+# them aggressively. 24h TTL keeps the per-scrape cost down — without
+# this, every cold cache miss re-fetches every region's standings.
+CACHE_TTL_STANDINGS = 24 * 60 * 60  # 24 hours
+
 async def _fetch_event_standings(event_id: str, client) -> dict:
     """Scrape /event/{id} to build {player_id: placement}.
 
@@ -1338,7 +1343,13 @@ async def _fetch_event_standings(event_id: str, client) -> dict:
     Tied placements (e.g. "5th–6th") give both teams placement = 5
     (the lower bound). Used as the primary tiebreaker on the
     frontend when many players cap at the same SKILL grade.
+
+    Cached at 24h TTL — standings only change when an event
+    finalizes, so re-fetching per stats scrape is wasted effort.
     """
+    cached = cache_manager.get(CACHE_TTL_STANDINGS, "standings", event_id)
+    if cached is not None:
+        return cached
     url = f"{VLR_BASE_URL}/event/{event_id}"
     try:
         resp = await fetch_with_retries(
@@ -1399,6 +1410,7 @@ async def _fetch_event_standings(event_id: str, client) -> dict:
                 pid = parts[1]
                 if pid.isdigit():
                     player_to_placement[pid] = placement
+    cache_manager.set(CACHE_TTL_STANDINGS, player_to_placement, "standings", event_id)
     return player_to_placement
 
 
@@ -1416,6 +1428,11 @@ async def _fetch_gc_via_subevents(client) -> list:
         *[_fetch_event_rows(eid, client, semaphore) for eid, _, _ in subevents]
     )
     merged: list = []
+    # Per-player event breakdown — every sub-event the player appeared
+    # in, with that event's tier/rounds/rating. Frontend renders this
+    # in the detail panel so users can see WHY a player's main_rating
+    # is what it is (Stage 1 strong, Cash Cup weak, etc.).
+    pid_to_events: dict = {}  # player_id → [event entries]
     # Track (region, eid) for each sub-event so we can identify the
     # latest completed main event per region for standings tiebreaker.
     latest_completed_by_region: dict = {}  # region → (eid, name)
@@ -1423,6 +1440,28 @@ async def _fetch_gc_via_subevents(client) -> list:
         nl = name.lower()
         tier = _classify_event_tier(name, "gc")
         evt_region = _gc_event_region(nl)
+        # Capture per-event stats per player BEFORE _merge collapses
+        # them. Skip rows with no rounds (player didn't actually play).
+        for r in rows:
+            pid = r.get("player_id")
+            if not pid:
+                continue
+            try:
+                rds = int(_to_float(r.get("rounds_played")))
+            except Exception:
+                rds = 0
+            if rds <= 0:
+                continue
+            pid_to_events.setdefault(pid, []).append({
+                "event_id": eid,
+                "event_name": name,
+                "tier": round(tier, 2),
+                "is_ongoing": bool(is_ongoing),
+                "rounds": rds,
+                "rating": r.get("rating") or "0",
+                "acs": r.get("average_combat_score") or "0",
+                "kd": r.get("kill_deaths") or "0",
+            })
         merged = _merge(
             merged, rows,
             secondary_tier=tier,
@@ -1470,6 +1509,15 @@ async def _fetch_gc_via_subevents(client) -> list:
         pid = r.get("player_id")
         if pid and pid in pid_to_placement:
             r["team_placement"] = pid_to_placement[pid]
+        # Per-event breakdown — sorted by tier desc then rounds desc so
+        # the highest-quality events float to the top of the detail
+        # panel display.
+        if pid and pid in pid_to_events:
+            events = sorted(
+                pid_to_events[pid],
+                key=lambda e: (-e["tier"], -e["rounds"]),
+            )
+            r["events_breakdown"] = events
 
     for r in merged:
         r.pop("_acc_weight", None)
