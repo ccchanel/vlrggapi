@@ -446,6 +446,13 @@ TIER_KICKOFF = 0.92      # GC Kickoff Playoffs — pre-season main bracket,
                          # counts as main (>= 0.85) for main_* aggregation
                          # but contributes less to the rounds-weighted
                          # aggregate event_tier.
+TIER_CASH_CUP = 0.85     # GC Cash Cups — side competition but legit
+                         # main-org play (real teams, real prize, just
+                         # smaller bracket). User: "cash cups still
+                         # count at stats, just not as much as main
+                         # event". Counts in main_* via tier-weighted
+                         # aggregation so cash cup rounds contribute
+                         # ~85% of a Stage round's weight.
 TIER_GC = 0.85           # Game Changers — legit pro circuit, treat ~= VCL
                          # (used when a stray GC event surfaces on a
                          # non-gc region request)
@@ -606,10 +613,12 @@ def _classify_event_tier(name: str, region_key: str) -> float:
         or "vctgc" in n.replace(" ", "")
     )
     if is_gc_event:
-        # Cash Cups are smaller side events; demote to OTHER so they
-        # don't inflate scores from a few low-stakes matches.
+        # Cash Cups — legit main-org side bracket. TIER_CASH_CUP (0.85)
+        # so the stats count toward main_* aggregation but at lower
+        # tier weight than full Stage events. User: "cash cups still
+        # count at stats, just not as much as main event".
         if "cash cup" in n or "cashcup" in n.replace(" ", ""):
-            return TIER_OTHER
+            return TIER_CASH_CUP
         # Kickoff Playoffs — pre-season main bracket, slight drop-off
         # from full Stage 1/2 weight. User: "give the kickoff a slight
         # drop-off compared to main event". Still counts as main
@@ -976,27 +985,37 @@ def _merge(
             else:
                 r["event_region"] = ""
             # Parallel main-event stats. Two field sets so the frontend
-            # can distinguish "any Stage production this season" from
-            # "currently rostered in the active main bracket":
-            #   · main_*  → Stage 1 + Stage 2 + Champions only
-            #     (TIER_VCT >= 0.95). Used for GRADING. Kickoff
-            #     production (TIER_KICKOFF 0.92) is intentionally
-            #     EXCLUDED — user flagged that Jade-style Kickoff-
-            #     heavy stats were inflating SKILL grade. Cash cups /
-            #     PQ / EEQ / P/R already excluded by tier threshold.
+            # can distinguish "main-bracket-tier production this season"
+            # (Stage + Kickoff + Cash Cup) from "currently rostered in
+            # the active main bracket" (Stage 2 only):
+            #   · main_*  → tier-weighted across Stage 1/2/Champs
+            #     (TIER_VCT 1.00), Kickoff (TIER_KICKOFF 0.92), and
+            #     Cash Cup (TIER_CASH_CUP 0.85). Side events (PQ /
+            #     EEQ / P/R / OTHER 0.50) are EXCLUDED — they only
+            #     affect Scout Score via the aggregate path.
             #   · current_main_rounds_played → ongoing Stage main
-            #     only (Stage 2 right now). Used for the not-in-
-            #     main-bracket eligibility check on the frontend.
-            is_main = secondary_tier >= 0.95
-            is_current_main = is_main and secondary_is_ongoing
+            #     only (Stage 2 right now, TIER_VCT >= 0.95). Used
+            #     for the not-in-main-bracket eligibility check.
+            # Stats use tier × rounds weighting in the merge below so
+            # a Cash Cup round contributes ~85% of a Stage round.
+            is_main = secondary_tier >= 0.85
+            is_current_main = secondary_tier >= 0.95 and secondary_is_ongoing
             if is_main:
+                # Round count tracks the raw rounds (used by frontend
+                # for sample-size logic). Tier weighting is applied
+                # only inside the stat aggregation.
                 r["main_rounds_played"] = str(int(new_rounds))
+                # _main_stat_weight = effective sample for the weighted
+                # mean. Stage rounds count at 1.0, Kickoff at 0.92,
+                # Cash Cup at 0.85.
+                r["_main_stat_weight"] = new_rounds * secondary_tier
                 for f in _WEIGHTED_FIELDS:
                     r[f"main_{f}"] = r.get(f, "0") or "0"
                 for f in _PERCENT_FIELDS:
                     r[f"main_{f}"] = r.get(f, "0") or "0"
             else:
                 r["main_rounds_played"] = "0"
+                r["_main_stat_weight"] = 0
                 for f in _WEIGHTED_FIELDS + _PERCENT_FIELDS:
                     r[f"main_{f}"] = "0"
             r["current_main_rounds_played"] = (
@@ -1077,36 +1096,43 @@ def _merge(
 
         # Track CURRENTLY ONGOING Stage main rounds separately so the
         # frontend can apply the not-in-main-bracket penalty even
-        # to players with strong past-Stage production.
+        # to players with strong past-Stage production. Stage-only
+        # gate (>= 0.95) — cash cup / kickoff don't count as
+        # "currently in main bracket".
         if secondary_tier >= 0.95 and secondary_is_ongoing and new_rounds > 0:
             old_curr = _to_float(existing.get("current_main_rounds_played", 0))
             existing["current_main_rounds_played"] = str(int(old_curr + new_rounds))
 
-        # Main-event aggregation across Stage 1 + Stage 2 + Champions.
-        # Excludes Kickoff (TIER_KICKOFF 0.92) — Kickoff production
-        # was inflating Jade-style players' main_rating because their
-        # Kickoff numbers were higher than their Stage numbers. With
-        # Kickoff excluded, main_rating reflects ONLY Stage / Champs
-        # production, which is what SKILL grade should reward.
-        if secondary_tier >= 0.95 and new_rounds > 0:
+        # Main-event aggregation across Stage 1/2/Champs + Kickoff +
+        # Cash Cup, TIER × ROUNDS weighted. Stage rounds at 1.0 weight,
+        # Kickoff at 0.92, Cash Cup at 0.85. A player who racks up
+        # cash-cup volume but is mediocre in Stage gets the cash cup
+        # production counted but proportionally less than equivalent
+        # Stage production. main_rounds_played still tracks raw
+        # rounds (used by frontend for sample-size logic).
+        if secondary_tier >= 0.85 and new_rounds > 0:
             old_main_rounds = _to_float(existing.get("main_rounds_played", 0))
+            old_stat_weight = _to_float(existing.get("_main_stat_weight", 0))
+            new_stat_weight = new_rounds * secondary_tier
             total_main_rounds = old_main_rounds + new_rounds
+            total_stat_weight = old_stat_weight + new_stat_weight
             for f in _WEIGHTED_FIELDS:
                 main_f = f"main_{f}"
                 old_v = _to_float(existing.get(main_f, 0))
                 new_v = _to_float(r.get(f))
-                if total_main_rounds > 0:
-                    avg = (old_v * old_main_rounds + new_v * new_rounds) / total_main_rounds
+                if total_stat_weight > 0:
+                    avg = (old_v * old_stat_weight + new_v * new_stat_weight) / total_stat_weight
                     existing[main_f] = f"{avg:.2f}"
             for f in _PERCENT_FIELDS:
                 main_f = f"main_{f}"
                 old_v = _to_float(existing.get(main_f, 0))
                 new_v = _to_float(r.get(f))
-                if total_main_rounds > 0:
-                    avg = (old_v * old_main_rounds + new_v * new_rounds) / total_main_rounds
+                if total_stat_weight > 0:
+                    avg = (old_v * old_stat_weight + new_v * new_stat_weight) / total_stat_weight
                     had_pct = "%" in str(existing.get(main_f) or "") or "%" in str(r.get(f) or "")
                     existing[main_f] = f"{round(avg)}%" if had_pct else f"{avg:.2f}"
             existing["main_rounds_played"] = str(int(total_main_rounds))
+            existing["_main_stat_weight"] = total_stat_weight
 
     return out
 
@@ -1147,6 +1173,7 @@ async def _fetch_all_for_region(
         r.pop("_acc_weight", None)
         r.pop("_vcl_rounds", None)
         r.pop("_rounds_by_region", None)
+        r.pop("_main_stat_weight", None)
     return merged
 
 
@@ -1346,6 +1373,7 @@ async def _fetch_gc_via_subevents(client) -> list:
         r.pop("_acc_weight", None)
         r.pop("_vcl_rounds", None)
         r.pop("_rounds_by_region", None)
+        r.pop("_main_stat_weight", None)
     return merged
 
 
