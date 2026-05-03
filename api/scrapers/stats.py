@@ -962,19 +962,22 @@ def _merge(
                 r["event_region"] = secondary_event_region
             else:
                 r["event_region"] = ""
-            # Parallel main-event-only stats. Frontend uses these for
-            # the skill grade so a player who plays both main bracket
-            # and cash cups (star FKS.S, etc.) gets graded on their
-            # main-bracket production specifically — NOT their inflated
-            # cash-cup stats dragged through a tier penalty. Gates:
-            #   · event_tier ≥ 0.85 = "main-bracket" (real Stage /
-            #     Championship / Kickoff, no Cash Cup / P/R / PQ)
-            #   · is_ongoing = the event is CURRENT (Stage 2 right now,
-            #     not Stage 1 from earlier this year). A player who
-            #     washed out of Stage 1 and isn't on a Stage 2 roster
-            #     shouldn't keep top-of-leaderboard skill grade off
-            #     historical Stage 1 stats.
-            is_main = secondary_tier >= 0.85 and secondary_is_ongoing
+            # Parallel main-event stats. Two field sets so the frontend
+            # can distinguish "any main-bracket production this season"
+            # from "currently rostered in the active main bracket":
+            #   · main_*  → all main-bracket rounds (Stage 1 + Stage 2 +
+            #     Kickoff + Champs etc., regardless of completed/
+            #     ongoing). Used for GRADING — a player's full season
+            #     of main-bracket production gets credit, not just their
+            #     small early-Stage-2 sample. LizA's 1000+ Stage 1 rounds
+            #     count alongside her 51 Stage 2 rounds.
+            #   · current_main_rounds_played → ongoing main only. Used
+            #     for the not-in-main-bracket eligibility check on the
+            #     frontend (silentsoul / iishkkaa / Ye etc. land at 0
+            #     here even if their main_rounds is high — Stage 1 is
+            #     completed, no Stage 2 spot).
+            is_main = secondary_tier >= 0.85
+            is_current_main = is_main and secondary_is_ongoing
             if is_main:
                 r["main_rounds_played"] = str(int(new_rounds))
                 for f in _WEIGHTED_FIELDS:
@@ -985,6 +988,9 @@ def _merge(
                 r["main_rounds_played"] = "0"
                 for f in _WEIGHTED_FIELDS + _PERCENT_FIELDS:
                     r[f"main_{f}"] = "0"
+            r["current_main_rounds_played"] = (
+                str(int(new_rounds)) if is_current_main else "0"
+            )
             out.append(r)
             if pid:
                 by_id[pid] = len(out) - 1
@@ -1058,14 +1064,21 @@ def _merge(
             existing["_rounds_by_region"] = rbr
             existing["event_region"] = max(rbr.items(), key=lambda kv: kv[1])[0]
 
-        # Main-event-only aggregation. Same rounds-weighted mean as the
-        # primary aggregate, but only counts contributions from sub-events
-        # at TIER_VCT-equivalent weight (>= 0.85: real Stage / Champs /
-        # Kickoff) AND currently ongoing (Stage 2 EMEA in May 2026, NOT
-        # ex-Stage 1 stats from earlier this year). A player who washed
-        # out of Stage 1 keeps her aggregate stats for display but loses
-        # main-event credit for grading purposes.
+        # Track CURRENTLY ONGOING main rounds separately so the
+        # frontend can apply the not-in-main-bracket penalty even
+        # to players with strong past-main-bracket production.
         if secondary_tier >= 0.85 and secondary_is_ongoing and new_rounds > 0:
+            old_curr = _to_float(existing.get("current_main_rounds_played", 0))
+            existing["current_main_rounds_played"] = str(int(old_curr + new_rounds))
+
+        # Main-event aggregation across the FULL season. Counts any
+        # sub-event at TIER_VCT-equivalent weight (>= 0.85: real Stage /
+        # Champs / Kickoff), regardless of completed/ongoing status.
+        # LizA's 1000+ Stage 1 rounds at strong stats count alongside
+        # her 51 Stage 2 rounds — the eligibility gate
+        # (current_main_rounds_played) handles whether she's still
+        # in the bracket; this aggregation handles WHAT to grade her on.
+        if secondary_tier >= 0.85 and new_rounds > 0:
             old_main_rounds = _to_float(existing.get("main_rounds_played", 0))
             total_main_rounds = old_main_rounds + new_rounds
             for f in _WEIGHTED_FIELDS:
