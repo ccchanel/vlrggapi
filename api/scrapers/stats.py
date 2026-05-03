@@ -1327,6 +1327,76 @@ async def _fetch_event_rows(
         return []
 
 
+async def _fetch_event_standings(event_id: str, client) -> dict:
+    """Scrape /event/{id} to build {player_id: placement}.
+
+    Joins the Prize Distribution table (team_name → placement) with
+    the Participating Teams section (team_name → list of player_ids)
+    so the result is a direct player_id lookup. Avoids fuzzy name
+    matching between standings and player records.
+
+    Tied placements (e.g. "5th–6th") give both teams placement = 5
+    (the lower bound). Used as the primary tiebreaker on the
+    frontend when many players cap at the same SKILL grade.
+    """
+    url = f"{VLR_BASE_URL}/event/{event_id}"
+    try:
+        resp = await fetch_with_retries(
+            url, client=client, timeout=15, max_retries=2
+        )
+    except Exception as exc:
+        logger.warning("Event standings fetch failed for %s: %s", event_id, exc)
+        return {}
+    html = HTMLParser(resp.text)
+
+    # 1) Parse Prize Distribution table → team_name (uppercase) → placement
+    team_to_placement: dict = {}
+    table = html.css_first("table.wf-ptable--standings")
+    if table:
+        import re as _re
+        for row in table.css("tr"):
+            cells = row.css("td")
+            if len(cells) < 3:
+                continue
+            place_text = (cells[0].text(strip=True) or "")
+            m = _re.match(r"(\d+)", place_text)
+            if not m:
+                continue
+            placement = int(m.group(1))
+            team_link = cells[2].css_first("a[href*='/team/']")
+            team_name = ""
+            if team_link:
+                team_name = (team_link.text(strip=True) or "").strip()
+            if not team_name:
+                team_name = (cells[2].text(strip=True) or "").strip()
+            if not team_name:
+                continue
+            team_to_placement[team_name.upper()] = placement
+    if not team_to_placement:
+        return {}
+
+    # 2) Parse Participating Teams section → team_name (uppercase)
+    #    → list of player_ids. Each .event-team block contains the
+    #    team name + roster links.
+    player_to_placement: dict = {}
+    for team_block in html.css(".event-team"):
+        name_node = team_block.css_first(".event-team-name")
+        team_name = (name_node.text(strip=True) if name_node else "").strip().upper()
+        if not team_name:
+            continue
+        placement = team_to_placement.get(team_name)
+        if placement is None:
+            continue
+        for player_link in team_block.css('a[href^="/player/"]'):
+            href = player_link.attributes.get("href", "") or ""
+            parts = href.strip("/").split("/")
+            if len(parts) >= 2 and parts[0] == "player":
+                pid = parts[1]
+                if pid.isdigit():
+                    player_to_placement[pid] = placement
+    return player_to_placement
+
+
 async def _fetch_gc_via_subevents(client) -> list:
     """Replacement for the GC year-level scrape. Walks every discovered
     sub-event individually so each one carries its own tier into the
@@ -1341,6 +1411,9 @@ async def _fetch_gc_via_subevents(client) -> list:
         *[_fetch_event_rows(eid, client, semaphore) for eid, _, _ in subevents]
     )
     merged: list = []
+    # Track (region, eid) for each sub-event so we can identify the
+    # latest completed main event per region for standings tiebreaker.
+    latest_completed_by_region: dict = {}  # region → (eid, name)
     for (eid, name, is_ongoing), rows in zip(subevents, fetched):
         nl = name.lower()
         tier = _classify_event_tier(name, "gc")
@@ -1351,10 +1424,48 @@ async def _fetch_gc_via_subevents(client) -> list:
             secondary_event_region=evt_region,
             secondary_is_ongoing=is_ongoing,
         )
+        # Track latest completed MAIN event per region. Tier >= 0.95 =
+        # Stage / Champs (no Cash Cup, Kickoff, P/R). Sort by event_id
+        # descending to pick the most recent completion.
+        if tier >= 0.95 and not is_ongoing and evt_region:
+            try:
+                cur_eid_int = int(eid)
+                prev = latest_completed_by_region.get(evt_region)
+                if prev is None or cur_eid_int > int(prev[0]):
+                    latest_completed_by_region[evt_region] = (eid, name)
+            except (TypeError, ValueError):
+                pass
         logger.debug(
             "GC sub-event [%s] %r → tier=%.2f, region=%r, ongoing=%s, rows=%d",
             eid, name, tier, evt_region, is_ongoing, len(rows),
         )
+
+    # Fetch standings for the latest completed main event per region.
+    # The standings parser returns {player_id: placement} directly
+    # by joining the Prize Distribution table with the Participating
+    # Teams roster section — no fuzzy team-name matching required.
+    pid_to_placement: dict = {}
+    if latest_completed_by_region:
+        items = list(latest_completed_by_region.items())
+        results = await asyncio.gather(
+            *[_fetch_event_standings(eid, client) for _, (eid, _) in items],
+            return_exceptions=True,
+        )
+        for (region, (eid, name)), result in zip(items, results):
+            if isinstance(result, Exception) or not result:
+                continue
+            for pid, placement in result.items():
+                pid_to_placement.setdefault(pid, placement)
+            logger.info(
+                "Standings for %s [%s] %r: %d players placed",
+                region, eid, name, len(result),
+            )
+
+    for r in merged:
+        pid = r.get("player_id")
+        if pid and pid in pid_to_placement:
+            r["team_placement"] = pid_to_placement[pid]
+
     for r in merged:
         r.pop("_acc_weight", None)
         r.pop("_vcl_rounds", None)
