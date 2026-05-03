@@ -976,20 +976,18 @@ def _merge(
             else:
                 r["event_region"] = ""
             # Parallel main-event stats. Two field sets so the frontend
-            # can distinguish "any main-bracket production this season"
-            # from "currently rostered in the active main bracket":
-            #   · main_*  → all main-bracket rounds (Stage 1 + Stage 2 +
-            #     Kickoff + Champs etc., regardless of completed/
-            #     ongoing). Used for GRADING — a player's full season
-            #     of main-bracket production gets credit, not just their
-            #     small early-Stage-2 sample. LizA's 1000+ Stage 1 rounds
-            #     count alongside her 51 Stage 2 rounds.
-            #   · current_main_rounds_played → ongoing main only. Used
-            #     for the not-in-main-bracket eligibility check on the
-            #     frontend (silentsoul / iishkkaa / Ye etc. land at 0
-            #     here even if their main_rounds is high — Stage 1 is
-            #     completed, no Stage 2 spot).
-            is_main = secondary_tier >= 0.85
+            # can distinguish "any Stage production this season" from
+            # "currently rostered in the active main bracket":
+            #   · main_*  → Stage 1 + Stage 2 + Champions only
+            #     (TIER_VCT >= 0.95). Used for GRADING. Kickoff
+            #     production (TIER_KICKOFF 0.92) is intentionally
+            #     EXCLUDED — user flagged that Jade-style Kickoff-
+            #     heavy stats were inflating SKILL grade. Cash cups /
+            #     PQ / EEQ / P/R already excluded by tier threshold.
+            #   · current_main_rounds_played → ongoing Stage main
+            #     only (Stage 2 right now). Used for the not-in-
+            #     main-bracket eligibility check on the frontend.
+            is_main = secondary_tier >= 0.95
             is_current_main = is_main and secondary_is_ongoing
             if is_main:
                 r["main_rounds_played"] = str(int(new_rounds))
@@ -1077,21 +1075,20 @@ def _merge(
             existing["_rounds_by_region"] = rbr
             existing["event_region"] = max(rbr.items(), key=lambda kv: kv[1])[0]
 
-        # Track CURRENTLY ONGOING main rounds separately so the
+        # Track CURRENTLY ONGOING Stage main rounds separately so the
         # frontend can apply the not-in-main-bracket penalty even
-        # to players with strong past-main-bracket production.
-        if secondary_tier >= 0.85 and secondary_is_ongoing and new_rounds > 0:
+        # to players with strong past-Stage production.
+        if secondary_tier >= 0.95 and secondary_is_ongoing and new_rounds > 0:
             old_curr = _to_float(existing.get("current_main_rounds_played", 0))
             existing["current_main_rounds_played"] = str(int(old_curr + new_rounds))
 
-        # Main-event aggregation across the FULL season. Counts any
-        # sub-event at TIER_VCT-equivalent weight (>= 0.85: real Stage /
-        # Champs / Kickoff), regardless of completed/ongoing status.
-        # LizA's 1000+ Stage 1 rounds at strong stats count alongside
-        # her 51 Stage 2 rounds — the eligibility gate
-        # (current_main_rounds_played) handles whether she's still
-        # in the bracket; this aggregation handles WHAT to grade her on.
-        if secondary_tier >= 0.85 and new_rounds > 0:
+        # Main-event aggregation across Stage 1 + Stage 2 + Champions.
+        # Excludes Kickoff (TIER_KICKOFF 0.92) — Kickoff production
+        # was inflating Jade-style players' main_rating because their
+        # Kickoff numbers were higher than their Stage numbers. With
+        # Kickoff excluded, main_rating reflects ONLY Stage / Champs
+        # production, which is what SKILL grade should reward.
+        if secondary_tier >= 0.95 and new_rounds > 0:
             old_main_rounds = _to_float(existing.get("main_rounds_played", 0))
             total_main_rounds = old_main_rounds + new_rounds
             for f in _WEIGHTED_FIELDS:
