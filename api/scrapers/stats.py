@@ -627,17 +627,17 @@ def _classify_event_tier(name: str, region_key: str) -> float:
         # event_tier.
         if "kickoff" in n:
             return TIER_KICKOFF
-        # In the GC region the main league IS the top tier of the
-        # circuit. Within that, the four major franchise regions
-        # (EMEA, NA, APAC/Pacific, Brazil) carry full TIER_VCT
-        # weight; smaller regional GC leagues (LATAM, Oceania,
-        # MENA, Asia) take a 20% haircut to TIER_GC_MINOR (0.80)
-        # because the talent pool is shallower and raw stats from
-        # those populations don't translate 1:1 with the majors.
-        # The match is on the EVENT name, so it reflects which
-        # league the team competed in (not where the player is from).
+        # In the GC region every Stage / Split is a main bracket for
+        # its sub-region (Korea Split, Japan Split, SEA Split, Oceania
+        # Split, EMEA Stage, NA Stage, Brazil Stage, etc.). All return
+        # TIER_VCT. Talent-pool differences between sub-regions are
+        # handled frontend-side via _gcSubRegionMult (0.85× for
+        # KR/JP/CN/LATAM, 1.0 for EMEA/NA/APAC/Brazil) — applying
+        # TIER_GC_MINOR here as well was double-penalising and
+        # making every APAC player land at the same B 65 because
+        # their main_rounds stayed at 0 (gate at >= 0.95).
         if region_key == "gc":
-            return TIER_GC_MINOR if _is_gc_minor_region(n) else TIER_VCT
+            return TIER_VCT
         # In other regions a stray GC event would still represent
         # T2-equivalent skill (TIER_VCL).
         return TIER_VCL
