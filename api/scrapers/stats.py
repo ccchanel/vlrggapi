@@ -441,6 +441,11 @@ MAX_EVENT_GROUPS_GC = 12
 
 TIER_VCT = 1.00          # VCT International League / Masters / Champions
 TIER_VCL = 0.85          # VCL / Challengers / Ascension
+TIER_KICKOFF = 0.92      # GC Kickoff Playoffs — pre-season main bracket,
+                         # slight drop from full Stage 1/2 weight. Still
+                         # counts as main (>= 0.85) for main_* aggregation
+                         # but contributes less to the rounds-weighted
+                         # aggregate event_tier.
 TIER_GC = 0.85           # Game Changers — legit pro circuit, treat ~= VCL
                          # (used when a stray GC event surfaces on a
                          # non-gc region request)
@@ -605,6 +610,14 @@ def _classify_event_tier(name: str, region_key: str) -> float:
         # don't inflate scores from a few low-stakes matches.
         if "cash cup" in n or "cashcup" in n.replace(" ", ""):
             return TIER_OTHER
+        # Kickoff Playoffs — pre-season main bracket, slight drop-off
+        # from full Stage 1/2 weight. User: "give the kickoff a slight
+        # drop-off compared to main event". Still counts as main
+        # (TIER_KICKOFF >= 0.85) for main_* aggregation, just contributes
+        # a slightly lower tier weight to the rounds-weighted aggregate
+        # event_tier.
+        if "kickoff" in n:
+            return TIER_KICKOFF
         # In the GC region the main league IS the top tier of the
         # circuit. Within that, the four major franchise regions
         # (EMEA, NA, APAC/Pacific, Brazil) carry full TIER_VCT
