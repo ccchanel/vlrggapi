@@ -1,7 +1,10 @@
 """
 V2 API router — standardized responses, validation, Pydantic models.
 """
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -776,6 +779,147 @@ async def v2_admin_create_user(
             "user_id": user_data.get("id"),
             "email": user_data.get("email"),
             "created_at": user_data.get("created_at"),
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Admin: mirror VLR team logos to R2.
+#
+# VLR serves logos from owcdn.net which routinely 404s when teams
+# rebrand — patching a hardcoded fallback list every few months is
+# unsustainable. This endpoint mirrors each unique URL to R2 once,
+# and the frontend's _resolveLogoUrl checks team_logo_mirror first
+# before falling back to the original URL. Permanent fix.
+#
+# POST body: { urls: ["https://owcdn.net/img/...", ...], optional team_meta }
+# Response:  { status: "success", data: { mirrored, skipped, errors } }
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _MirrorLogosRequest(BaseModel):
+    urls: list[str] = Field(..., min_length=1, max_length=500)
+    # Optional metadata so we can surface team tag/name in the mirror
+    # table without re-deriving from URLs. Keyed by URL.
+    team_meta: dict[str, dict] | None = Field(default=None)
+
+
+@router.post("/admin/mirror-logos")
+@limiter.limit("6/minute")
+async def v2_admin_mirror_logos(
+    request: Request,
+    body: _MirrorLogosRequest,
+    x_admin_secret: str = Header(default=""),
+):
+    """One-shot mirror endpoint. Iterates URLs, skips already-mirrored
+    rows, downloads the rest via the existing scraper http_client (so
+    Cloudflare proxies / cookie state are reused), uploads to R2, and
+    upserts the resulting mapping into public.team_logo_mirror.
+    """
+    _check_admin(x_admin_secret)
+
+    supabase_url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+    service_role = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    if not supabase_url or not service_role:
+        raise HTTPException(
+            status_code=503,
+            detail="Logo mirror not configured — need SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY env.",
+        )
+
+    # De-dupe + drop falsy / non-http URLs upfront.
+    urls = []
+    seen = set()
+    for u in body.urls:
+        u = (u or "").strip()
+        if not u or not u.lower().startswith(("http://", "https://")):
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        urls.append(u)
+    if not urls:
+        return {"status": "success", "data": {"mirrored": 0, "skipped": 0, "errors": []}}
+
+    import httpx as _httpx
+    from utils.http_client import get_http_client
+    from api.scrapers.r2_uploads import mirror_logo_to_r2
+
+    sb_headers = {
+        "apikey": service_role,
+        "Authorization": f"Bearer {service_role}",
+        "Content-Type": "application/json",
+    }
+
+    # Look up which of the requested URLs are already mirrored. One
+    # query (in batches of 100) instead of N round-trips.
+    already: set[str] = set()
+    async with _httpx.AsyncClient(timeout=15.0) as sb_client:
+        BATCH = 100
+        for i in range(0, len(urls), BATCH):
+            chunk = urls[i:i + BATCH]
+            # PostgREST `in.()` filter — values must be quoted.
+            in_list = ",".join('"' + u.replace('"', '""') + '"' for u in chunk)
+            try:
+                resp = await sb_client.get(
+                    f"{supabase_url}/rest/v1/team_logo_mirror",
+                    headers=sb_headers,
+                    params={"select": "vlr_url", "vlr_url": f"in.({in_list})"},
+                )
+                if resp.status_code == 200:
+                    for row in resp.json():
+                        already.add(row.get("vlr_url"))
+            except Exception as exc:
+                logger.warning("mirror-logos: pre-check failed for batch: %s", exc)
+
+    todo = [u for u in urls if u not in already]
+    skipped = len(already)
+    mirrored = 0
+    errors: list[dict] = []
+
+    # Download via the scraper http_client so we inherit the Cloudflare
+    # proxy / cookie behaviour. Logos are tiny (~50 KB) so we don't
+    # need any special concurrency tuning — sequential is fine.
+    client = get_http_client()
+    rows_to_upsert: list[dict] = []
+    for u in todo:
+        try:
+            r = await client.get(u, timeout=15.0, follow_redirects=True)
+            if r.status_code != 200 or not r.content:
+                errors.append({"url": u, "error": f"fetch HTTP {r.status_code}"})
+                continue
+            ct = r.headers.get("content-type", "")
+            row = mirror_logo_to_r2(u, r.content, ct)
+            # Layer in team metadata if supplied.
+            meta = (body.team_meta or {}).get(u) or {}
+            if meta.get("team_tag"):
+                row["team_tag"] = str(meta["team_tag"])[:32]
+            if meta.get("team_name"):
+                row["team_name"] = str(meta["team_name"])[:120]
+            rows_to_upsert.append(row)
+            mirrored += 1
+        except Exception as exc:
+            errors.append({"url": u, "error": str(exc)})
+
+    # Bulk upsert into Supabase. Single round-trip beats N inserts.
+    if rows_to_upsert:
+        async with _httpx.AsyncClient(timeout=20.0) as sb_client:
+            try:
+                resp = await sb_client.post(
+                    f"{supabase_url}/rest/v1/team_logo_mirror",
+                    headers={**sb_headers, "Prefer": "resolution=merge-duplicates"},
+                    json=rows_to_upsert,
+                )
+                if resp.status_code >= 400:
+                    errors.append({"supabase_upsert": resp.text[:500]})
+            except Exception as exc:
+                errors.append({"supabase_upsert_exc": str(exc)})
+
+    return {
+        "status": "success",
+        "data": {
+            "mirrored": mirrored,
+            "skipped": skipped,
+            "errors": errors,
         },
     }
 

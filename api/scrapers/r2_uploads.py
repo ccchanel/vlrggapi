@@ -289,3 +289,100 @@ def abort_multipart_upload(object_key: str, upload_id: str) -> dict:
         UploadId=upload_id,
     )
     return {"aborted": True}
+
+
+# ── Team-logo mirror (server-side upload) ─────────────────────────────
+# Solves the recurring "owcdn.net logos go dead" problem. VLR serves
+# logos from owcdn.net, which replaces / removes assets when teams
+# rebrand. We mirror each unique logo URL to R2 once, then frontend
+# routes through R2 forever. Uploads go server-side here (not via
+# presigned URL) because (a) the byte payload is tiny (~50 KB), and
+# (b) we control the source URL, so SSRF / size-bound concerns of
+# user-uploaded content don't apply.
+
+import hashlib
+
+_LOGO_PREFIX = "team-logos/"
+# Hard cap per logo so a misclassified URL pointing at a huge file
+# doesn't blow up R2 storage or hold the request open.
+_MAX_LOGO_BYTES = 5 * 1024 * 1024  # 5 MB
+# Allowed extensions / content types — VLR logos are PNG / WebP / JPG
+# in practice. SVG is allowed too since some Liquipedia fallbacks ship
+# SVG; we serve them with image/svg+xml.
+_LOGO_EXT_BY_CT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/svg+xml": ".svg",
+    "image/gif": ".gif",
+}
+
+
+def _logo_ext_from(url: str, content_type: str) -> str:
+    """Pick a file extension. Prefer content-type, fall back to URL."""
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct in _LOGO_EXT_BY_CT:
+        return _LOGO_EXT_BY_CT[ct]
+    # Fall back to the URL extension if it's recognisable.
+    m = re.search(r"\.(png|jpe?g|webp|svg|gif)(?:[?#]|$)", url, flags=re.I)
+    if m:
+        ext = m.group(1).lower()
+        if ext == "jpeg":
+            ext = "jpg"
+        return f".{ext}"
+    return ".png"
+
+
+def mirror_logo_to_r2(vlr_url: str, image_bytes: bytes, content_type: str) -> dict:
+    """Upload a single team logo to R2. Returns a dict ready to upsert
+    into the public.team_logo_mirror Supabase table.
+
+    Raises ValueError on size limit, RuntimeError on R2 misconfig.
+    The caller is responsible for fetching `image_bytes` from VLR's
+    CDN (so we don't have to recreate the proxy / cookie logic here).
+    """
+    if not vlr_url:
+        raise ValueError("vlr_url required")
+    if not image_bytes:
+        raise ValueError("image_bytes empty")
+    if len(image_bytes) > _MAX_LOGO_BYTES:
+        raise ValueError(
+            f"Logo too large ({len(image_bytes)} bytes, max {_MAX_LOGO_BYTES})"
+        )
+
+    bucket = os.environ.get("R2_BUCKET", "").strip()
+    public_base = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip("/")
+    if not bucket or not public_base:
+        raise RuntimeError("R2_BUCKET and R2_PUBLIC_URL must be set")
+
+    # Stable key from URL hash so identical URLs across calls dedupe.
+    digest = hashlib.md5(vlr_url.encode("utf-8")).hexdigest()
+    ext = _logo_ext_from(vlr_url, content_type)
+    object_key = f"{_LOGO_PREFIX}{digest}{ext}"
+
+    # Pick a sensible Content-Type for the upload — mirror what we
+    # downloaded, fall back to image/png.
+    upload_ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if upload_ct not in _LOGO_EXT_BY_CT:
+        upload_ct = "image/png"
+
+    client = _get_client()
+    client.put_object(
+        Bucket=bucket,
+        Key=object_key,
+        Body=image_bytes,
+        ContentType=upload_ct,
+        # CacheControl: 30 days — logos are rarely re-cut, and our
+        # key is derived from the source URL so an updated logo gets
+        # a fresh URL anyway.
+        CacheControl="public, max-age=2592000, immutable",
+    )
+
+    return {
+        "vlr_url": vlr_url,
+        "r2_key": object_key,
+        "r2_url": f"{public_base}/{object_key}",
+        "content_type": upload_ct,
+        "size_bytes": len(image_bytes),
+    }
