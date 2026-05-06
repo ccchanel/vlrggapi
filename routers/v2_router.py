@@ -773,11 +773,51 @@ async def v2_admin_create_user(
         raise HTTPException(status_code=resp.status_code, detail=message)
 
     user_data = resp.json()
+
+    # Pre-seed the profiles row so the new user appears in the admin
+    # access-log table immediately, instead of having to wait for them
+    # to log in for the first time. The login flow's upsert is
+    # idempotent — if the user does log in later, last_seen gets
+    # updated normally. Best-effort: a failure here doesn't fail the
+    # auth-user creation (which already succeeded above).
+    new_user_id = user_data.get("id")
+    new_user_email = user_data.get("email")
+    if new_user_id and new_user_email:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                await client.post(
+                    f"{supabase_url}/rest/v1/profiles",
+                    headers={
+                        "apikey": service_role,
+                        "Authorization": f"Bearer {service_role}",
+                        "Content-Type": "application/json",
+                        # merge-duplicates handles race with first-login
+                        # upsert: whichever lands first wins; later
+                        # writes update last_seen normally.
+                        "Prefer": "resolution=merge-duplicates",
+                    },
+                    json={
+                        "id": new_user_id,
+                        "email": new_user_email,
+                        "display_name": (body.display_name or "").strip()
+                        if body.display_name
+                        else None,
+                        # last_seen left null until first real login;
+                        # admin UI can show "Never" for these rows.
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "create-user: profile pre-seed failed for %s: %s",
+                    new_user_id,
+                    exc,
+                )
+
     return {
         "status": "success",
         "data": {
-            "user_id": user_data.get("id"),
-            "email": user_data.get("email"),
+            "user_id": new_user_id,
+            "email": new_user_email,
             "created_at": user_data.get("created_at"),
         },
     }
