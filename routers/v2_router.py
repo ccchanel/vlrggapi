@@ -670,6 +670,43 @@ async def v2_vods_upload_abort(
     return {"status": "success", "data": result}
 
 
+# ── Chapters (.vtt sidecar) ──────────────────────────────────────────
+# Admin pastes simple "0:00 Map 1: Bind" lines in the upload form,
+# we render WebVTT server-side and PUT to R2 with the same object
+# key as the video but .vtt extension. The frontend Plyr instance
+# fetches this sibling at play time and overlays chapter markers.
+
+class _UploadChaptersRequest(BaseModel):
+    object_key: str = Field(..., max_length=512)
+    chapters_text: str = Field(..., max_length=20_000)
+
+
+@router.post("/vods/upload-chapters")
+@limiter.limit("30/minute")
+async def v2_vods_upload_chapters(
+    request: Request,
+    body: _UploadChaptersRequest,
+    x_admin_secret: str = Header(default=""),
+):
+    """Render the admin-pasted chapters text as WebVTT and upload to
+    R2 alongside the video. Idempotent: re-uploading overwrites the
+    prior .vtt at the same key."""
+    _check_admin(x_admin_secret)
+    try:
+        from api.scrapers.r2_uploads import upload_chapters_vtt
+        result = upload_chapters_vtt(
+            object_key=body.object_key,
+            chapters_text=body.chapters_text,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to upload chapters: {exc}")
+    return {"status": "success", "data": result}
+
+
 @router.get("/health", response_model=V2Response)
 async def v2_health():
     """Check API health and runtime readiness."""

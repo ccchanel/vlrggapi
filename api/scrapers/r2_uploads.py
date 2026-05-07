@@ -386,3 +386,109 @@ def mirror_logo_to_r2(vlr_url: str, image_bytes: bytes, content_type: str) -> di
         "content_type": upload_ct,
         "size_bytes": len(image_bytes),
     }
+
+
+# ── Chapters (.vtt) sidecar uploads ───────────────────────────────────
+# Admin pastes simple "0:00 Map 1: Bind" lines in the upload form;
+# we convert to WebVTT and PUT to R2 with the same object key as the
+# video but the extension swapped to .vtt. The frontend looks for
+# this sibling at play time and overlays chapter markers on Plyr.
+
+import re as _re_chapters
+
+
+def _parse_simple_chapters(text: str):
+    """Parse "0:00 Map 1: Bind" lines → [{time:int seconds, label:str}].
+
+    Accepts MM:SS, HH:MM:SS, or H:MM:SS prefixes. Lines without a
+    timestamp are ignored. Lines that have a timestamp but no label
+    are ignored too — empty cues serve no purpose. Sorted ascending."""
+    points = []
+    line_re = _re_chapters.compile(
+        r"^\s*(?:(\d+):)?(\d+):(\d{1,2})(?:\.\d+)?\s+(.+?)\s*$"
+    )
+    for raw in (text or "").splitlines():
+        m = line_re.match(raw)
+        if not m:
+            continue
+        h, m_, s = m.group(1), m.group(2), m.group(3)
+        label = m.group(4).strip()
+        if not label:
+            continue
+        if h is None:
+            seconds = int(m_) * 60 + int(s)
+        else:
+            seconds = int(h) * 3600 + int(m_) * 60 + int(s)
+        points.append({"time": seconds, "label": label})
+    points.sort(key=lambda p: p["time"])
+    return points
+
+
+def _format_vtt_timestamp(seconds: int) -> str:
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}.000"
+
+
+def chapters_text_to_vtt(text: str) -> str:
+    """Render the user-pasted chapter lines as a WebVTT chapters file.
+
+    Each cues end-time is the start-time of the next cue; the final
+    cue runs to 99:59:59 so it always covers the rest of the video
+    (Plyr clamps marker positions to actual duration anyway)."""
+    points = _parse_simple_chapters(text)
+    if not points:
+        raise ValueError("No valid chapter lines found.")
+    out = ["WEBVTT", ""]
+    for i, pt in enumerate(points):
+        end = points[i + 1]["time"] if i + 1 < len(points) else 99 * 3600 + 59 * 60 + 59
+        out.append(f"{_format_vtt_timestamp(pt[\"time\"])} --> {_format_vtt_timestamp(end)}")
+        out.append(pt["label"])
+        out.append("")
+    return "\n".join(out)
+
+
+def upload_chapters_vtt(object_key: str, chapters_text: str):
+    """Convert the admin-pasted chapters text and PUT the resulting
+    .vtt to R2 with the same key as the video but .vtt extension.
+
+    Returns {object_key, public_url, num_cues}.
+    """
+    bucket = os.environ.get("R2_BUCKET", "").strip()
+    public_base = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip("/")
+    if not bucket or not public_base:
+        raise RuntimeError("R2_BUCKET and R2_PUBLIC_URL must be set")
+    if not object_key or not isinstance(object_key, str):
+        raise ValueError("object_key required")
+
+    # Path traversal guard — the key came from the trusted upload-init
+    # response in the same admin session, but we still scope writes
+    # to keys we minted (which always start with vods/).
+    if ".." in object_key or not object_key.startswith("vods/"):
+        raise ValueError("object_key must be under vods/")
+
+    vtt_body = chapters_text_to_vtt(chapters_text)
+
+    # Swap the trailing extension for .vtt. If the key has no dot
+    # (unlikely given filename safety in mint_upload_url), append.
+    if "." in object_key.rsplit("/", 1)[-1]:
+        vtt_key = _re_chapters.sub(r"\.[^./]+$", ".vtt", object_key)
+    else:
+        vtt_key = object_key + ".vtt"
+
+    client = _get_client()
+    client.put_object(
+        Bucket=bucket,
+        Key=vtt_key,
+        Body=vtt_body.encode("utf-8"),
+        ContentType="text/vtt; charset=utf-8",
+        CacheControl="public, max-age=300",
+    )
+
+    num_cues = vtt_body.count("-->")
+    return {
+        "object_key": vtt_key,
+        "public_url": f"{public_base}/{vtt_key}",
+        "num_cues": num_cues,
+    }
+
