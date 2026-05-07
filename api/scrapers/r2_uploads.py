@@ -407,12 +407,18 @@ def _parse_simple_chapters(text: str):
     line_re = _re_chapters.compile(
         r"^\s*(?:(\d+):)?(\d+):(\d{1,2})(?:\.\d+)?\s+(.+?)\s*$"
     )
+    sep_re = _re_chapters.compile(r"^[-–—:|•·]+\s*")
     for raw in (text or "").splitlines():
         m = line_re.match(raw)
         if not m:
             continue
         h, m_, s = m.group(1), m.group(2), m.group(3)
         label = m.group(4).strip()
+        # Strip a leading separator the user typed between the
+        # timestamp and the title — "0:03:00 - Split" yields label
+        # "Split" instead of "- Split". Covers ASCII dash, en/em-dash,
+        # colon, pipe, bullet, and middle dot.
+        label = sep_re.sub("", label).strip()
         if not label:
             continue
         if h is None:
