@@ -448,7 +448,7 @@ def chapters_text_to_vtt(text: str) -> str:
     out = ["WEBVTT", ""]
     for i, pt in enumerate(points):
         end = points[i + 1]["time"] if i + 1 < len(points) else 99 * 3600 + 59 * 60 + 59
-        out.append(f"{_format_vtt_timestamp(pt[\"time\"])} --> {_format_vtt_timestamp(end)}")
+        out.append(f"{_format_vtt_timestamp(pt['time'])} --> {_format_vtt_timestamp(end)}")
         out.append(pt["label"])
         out.append("")
     return "\n".join(out)
