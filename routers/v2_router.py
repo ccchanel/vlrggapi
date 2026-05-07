@@ -304,6 +304,27 @@ async def v2_health_upstream(request: Request):
     }
 
 
+@router.get("/players/search")
+@limiter.limit(RATE_LIMIT)
+async def v2_players_search(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=64, description="Player name to search"),
+    limit: int = Query(5, ge=1, le=20, description="Max results"),
+):
+    """Resolve a player name to a VLR.GG player ID.
+
+    Powers the tracker → VLR direct-link feature: when we don't have
+    the player loaded in the frontend's cached stats, we'd otherwise
+    bounce the user to vlr.gg's search page. This endpoint hits that
+    same search and returns the first matches' ids + canonical
+    profile URLs so the frontend can redirect straight to the player
+    page instead.
+    """
+    from api.scrapers.player_search import search_players_by_name
+    result = await search_players_by_name(q, limit=limit)
+    return {"status": "success", "data": result}
+
+
 @router.get("/player")
 @limiter.limit(RATE_LIMIT)
 async def v2_player(
