@@ -41,6 +41,16 @@ jobs:
       - name: Install dependencies
         run: uv pip install --system -r requirements.txt
 
+      - name: Compile all Python (syntax check)
+        # pytest only imports modules in its test graph, so a SyntaxError
+        # in a module that's only referenced via lazy `from ... import`
+        # inside a route handler won't fail tests — but it WILL crash
+        # the Railway deploy at runtime. compileall walks every .py
+        # under the repo and refuses to byte-compile anything with a
+        # parse error, catching the whole class of "deploy fails
+        # silently for hours" bugs in 5 seconds.
+        run: python -m compileall -q .
+
       - name: Run tests
         run: pytest -q
 
