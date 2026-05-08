@@ -895,17 +895,72 @@ class _AdminDeleteUserRequest(BaseModel):
     user_id: str = Field(..., min_length=8, max_length=64)
 
 
+# Admin email allowlist — same identity check the frontend uses to
+# show the admin tab. Substring match on the user's email so any
+# variant (emirerdem2@gmail.com, ccchanels-projects, etc.) clears.
+_ADMIN_EMAIL_TOKENS = ("emirerdem2", "ccchanel")
+
+
+async def _verify_admin_session(authorization: str) -> str:
+    """Resolve a 'Bearer <jwt>' header against Supabase /auth/v1/user
+    and return the email if it's an admin. Raises 401 otherwise.
+    No prompts on the client — just relies on the existing logged-in
+    Supabase session.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token.")
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token.")
+
+    supabase_url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+    if not supabase_url:
+        raise HTTPException(status_code=503, detail="SUPABASE_URL not configured.")
+
+    import httpx as _httpx
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(
+                f"{supabase_url}/auth/v1/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    # Supabase /auth/v1/user requires the apikey header
+                    # too; the publishable anon key is fine here — we're
+                    # just resolving the access token to a user.
+                    "apikey": (os.environ.get("SUPABASE_ANON_KEY") or "").strip(),
+                },
+            )
+        except _httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Auth lookup failed: {exc}")
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=401, detail="Session invalid or expired.")
+
+    user = resp.json() or {}
+    email = (user.get("email") or "").lower()
+    if not any(tok in email for tok in _ADMIN_EMAIL_TOKENS):
+        raise HTTPException(status_code=403, detail="Not an admin account.")
+    return email
+
+
 @router.post("/admin/delete-user")
 @limiter.limit("10/minute")
 async def v2_admin_delete_user(
     request: Request,
     body: _AdminDeleteUserRequest,
     x_admin_secret: str = Header(default=""),
+    authorization: str = Header(default=""),
 ):
     """Permanently delete a Supabase auth user (and cascade their
-    profile/scout_data rows via FK). Requires X-Admin-Secret header.
+    profile/scout_data rows via FK). Auth: either X-Admin-Secret
+    (legacy / scriptable) or a Supabase Bearer token from the
+    currently-logged-in admin session (no prompt — uses what the
+    frontend already has).
     """
-    _check_admin(x_admin_secret)
+    if x_admin_secret and x_admin_secret.strip():
+        _check_admin(x_admin_secret)
+    else:
+        await _verify_admin_session(authorization)
 
     supabase_url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
     service_role = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
