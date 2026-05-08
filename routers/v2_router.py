@@ -882,6 +882,92 @@ async def v2_admin_create_user(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Admin: delete a user account.
+#
+# Mirror of /admin/create-user but DELETE. Calls Supabase's admin auth
+# endpoint with the Service Role key to remove the user from auth.users.
+# FK cascades + on-delete-cascade on profiles / scout_data should clean
+# up the linked rows. Same X-Admin-Secret header gate as create-user.
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _AdminDeleteUserRequest(BaseModel):
+    user_id: str = Field(..., min_length=8, max_length=64)
+
+
+@router.post("/admin/delete-user")
+@limiter.limit("10/minute")
+async def v2_admin_delete_user(
+    request: Request,
+    body: _AdminDeleteUserRequest,
+    x_admin_secret: str = Header(default=""),
+):
+    """Permanently delete a Supabase auth user (and cascade their
+    profile/scout_data rows via FK). Requires X-Admin-Secret header.
+    """
+    _check_admin(x_admin_secret)
+
+    supabase_url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+    service_role = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    if not supabase_url or not service_role:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Admin delete not configured — set SUPABASE_URL and "
+                "SUPABASE_SERVICE_ROLE_KEY in Railway env."
+            ),
+        )
+
+    user_id = body.user_id.strip()
+
+    import httpx as _httpx
+
+    # Best-effort cleanup of user-owned rows BEFORE the auth delete,
+    # in case the FK isn't set to ON DELETE CASCADE everywhere. Idempotent
+    # — if the rows don't exist, the DELETE is a no-op. If a cleanup
+    # fails the auth delete still proceeds; the row would just be
+    # orphaned.
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        for table in ("scout_data", "profiles"):
+            try:
+                await client.delete(
+                    f"{supabase_url}/rest/v1/{table}",
+                    headers={
+                        "apikey": service_role,
+                        "Authorization": f"Bearer {service_role}",
+                    },
+                    params={"id": f"eq.{user_id}"} if table == "profiles" else {"user_id": f"eq.{user_id}"},
+                )
+            except _httpx.HTTPError:
+                pass  # non-fatal
+
+    async with _httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.delete(
+                f"{supabase_url}/auth/v1/admin/users/{user_id}",
+                headers={
+                    "apikey": service_role,
+                    "Authorization": f"Bearer {service_role}",
+                },
+            )
+        except _httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not reach Supabase auth: {exc}",
+            )
+
+    if resp.status_code >= 400:
+        try:
+            err = resp.json()
+            message = err.get("msg") or err.get("error_description") or err.get("error") or resp.text
+        except Exception:
+            message = resp.text or f"Supabase returned {resp.status_code}"
+        raise HTTPException(status_code=resp.status_code, detail=message)
+
+    return {"status": "success", "data": {"user_id": user_id, "deleted": True}}
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Admin: mirror VLR team logos to R2.
 #
 # VLR serves logos from owcdn.net which routinely 404s when teams
