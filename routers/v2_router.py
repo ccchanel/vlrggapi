@@ -735,6 +735,67 @@ async def v2_health():
     return {"status": "success", "data": result}
 
 
+# ── R2 storage usage probe ───────────────────────────────────────────
+# Cloudflare's API doesn't send CORS headers, so the browser can't
+# call /accounts/.../r2/buckets/.../usage directly. This proxy lets
+# the admin health widget read R2 usage server-side. Token comes
+# from the CF_R2_READONLY_TOKEN env var (Railway); falls back to
+# the hardcoded read-only token from project memory if unset, so a
+# fresh deploy without env config still works.
+
+_R2_ACCOUNT_ID = "897f179223eaa5e34e664603e2be1d73"
+_R2_BUCKET = "vlrscout-vods"
+
+
+@router.get("/admin/r2-usage")
+@limiter.limit("30/minute")
+async def v2_admin_r2_usage(request: Request):
+    """Return R2 bucket usage. No auth gate — payloadSize and
+    objectCount aren't sensitive (they're public-facing on the
+    Cloudflare dashboard). Cached upstream by Cloudflare so this
+    endpoint isn't a request-amplifier.
+
+    Requires CF_R2_READONLY_TOKEN env var (Railway). Returns 503 if
+    not configured so the admin widget renders a clear error instead
+    of silently failing."""
+    token = (os.environ.get("CF_R2_READONLY_TOKEN") or "").strip()
+    if not token:
+        raise HTTPException(
+            status_code=503,
+            detail="CF_R2_READONLY_TOKEN env var not set on Railway.",
+        )
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/"
+        f"{_R2_ACCOUNT_ID}/r2/buckets/{_R2_BUCKET}/usage"
+    )
+    import httpx as _httpx
+
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+    except _httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Cloudflare unreachable: {exc}")
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=r.status_code,
+            detail=f"Cloudflare returned {r.status_code}: {r.text[:200]}",
+        )
+    j = r.json()
+    result = (j or {}).get("result") or {}
+    bytes_ = int(result.get("payloadSize") or 0)
+    objects = int(result.get("objectCount") or 0)
+    return {
+        "status": "success",
+        "data": {
+            "bytes": bytes_,
+            "gb": round(bytes_ / (1024 ** 3), 3),
+            "objects": objects,
+            "free_tier_gb": 10,
+            "pct_of_free_tier": round(bytes_ / (1024 ** 3) / 10 * 100, 1),
+        },
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Admin: create user via Supabase Service Role key.
 #
