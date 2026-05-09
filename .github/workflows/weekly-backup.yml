@@ -38,28 +38,6 @@ jobs:
             -H "Content-Type: application/json" \
             -H "X-Admin-Secret: $ADMIN_UPLOAD_SECRET" \
             -d '{}' \
-            -o backup_response.json
-          echo "--- backup response ---"
-          cat backup_response.json
-          echo
-
-      - name: POST /v2/admin/snapshot-players
-        # Weekly snapshot of every VCT region's /v2/stats output. Powers
-        # the admin "movers" report (week-over-week SKILL grade diffs).
-        # Runs after the backup so a snapshot failure doesn't cascade —
-        # the backup is the more critical of the two.
-        env:
-          API_BASE_URL: ${{ secrets.API_BASE_URL }}
-          ADMIN_UPLOAD_SECRET: ${{ secrets.ADMIN_UPLOAD_SECRET }}
-        run: |
-          set -euo pipefail
-          # Hitting /v2/stats per region can take 60-120s on a cold
-          # cache. 10-minute ceiling covers the worst case across all
-          # 7 regions even under load.
-          curl -fsSL --max-time 600 -X POST "$API_BASE_URL/v2/admin/snapshot-players" \
-            -H "Content-Type: application/json" \
-            -H "X-Admin-Secret: $ADMIN_UPLOAD_SECRET" \
-            -d '{}' \
-            -o snapshot_response.json
-          echo "--- snapshot response ---"
-          cat snapshot_response.json
+            -o response.json
+          echo "--- response ---"
+          cat response.json

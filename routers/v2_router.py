@@ -1034,30 +1034,6 @@ async def v2_admin_delete_user(
 # ─────────────────────────────────────────────────────────────────────
 
 
-# ── Weekly player-stats snapshot for the movers report ───────────────
-
-
-@router.post("/admin/snapshot-players")
-@limiter.limit("10/minute")
-async def v2_admin_snapshot_players(
-    request: Request,
-    x_admin_secret: str = Header(default=""),
-):
-    """Pull /v2/stats for every VCT region (90d) and store a single
-    jsonb row in player_snapshots dated today. Frontend movers widget
-    reads the two most recent rows and diffs SKILL grades. Same
-    X-Admin-Secret gate; called from a weekly GitHub Actions cron."""
-    _check_admin(x_admin_secret)
-    try:
-        from api.scrapers.snapshot_players import run_snapshot
-        result = await run_snapshot()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Snapshot failed: {exc}")
-    return {"status": "success", "data": result}
-
-
 @router.post("/admin/backup-scout-data")
 @limiter.limit("10/minute")
 async def v2_admin_backup_scout_data(
