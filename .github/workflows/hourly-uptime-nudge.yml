@@ -1,21 +1,13 @@
-name: Hourly uptime + cache nudge
+name: Hourly uptime ping
 
-# Hits the API hourly to:
-#  1. Catch a Railway deploy that quietly crashed and stayed down (no
-#     internal alerting otherwise — this turns the workflow red).
-#  2. Keep the tracker.gg cf_clearance cookie warm so a real user's
-#     first request after a quiet stretch doesn't pay the CF challenge
-#     latency.
-#
-# Pings two endpoints:
-#   - /v2/health → simple uptime ping
-#   - /v2/tracker/leaderboard?region=na → exercises the tracker-api
-#     side and refreshes the cf cookie before it ages out.
+# Hits both API services hourly so a Railway service that quietly
+# crashed shows as a red workflow run instead of dying silently
+# until a real user trips over it.
 #
 # Required repo variables:
-#   API_BASE_URL          — vlrggapi production URL (Railway)
-#   TRACKER_API_BASE_URL  — vlrscout-tracker-api production URL
-#                           (optional; tracker nudge skipped if unset)
+#   API_BASE_URL          vlrggapi production URL (Railway)
+#   TRACKER_API_BASE_URL  vlrscout-tracker-api production URL
+#                         (optional — tracker step skipped if unset)
 
 on:
   schedule:
@@ -38,25 +30,23 @@ jobs:
             echo "::error::API_BASE_URL repo variable not set." >&2
             exit 1
           fi
-          # 15s connect+read timeout — Railway cold-start adds maybe 5s,
-          # not 15s. If we time out the service is genuinely down.
-          curl -fsS --max-time 15 "$API_BASE_URL/v2/health" > /dev/null
+          # 20s budget — generous for Railway cold-start; a real outage
+          # is well past this.
+          curl -fsS --max-time 20 "$API_BASE_URL/v2/health" > /dev/null
           echo "::notice::API health OK"
 
-      - name: Tracker cache nudge (optional)
+      - name: Tracker API health
         env:
           TRACKER_API_BASE_URL: ${{ vars.TRACKER_API_BASE_URL }}
         run: |
           set -euo pipefail
           if [ -z "${TRACKER_API_BASE_URL:-}" ]; then
-            echo "::notice::TRACKER_API_BASE_URL not set — skipping tracker nudge."
+            echo "::notice::TRACKER_API_BASE_URL not set — skipping tracker ping."
             exit 0
           fi
-          # Best-effort — tracker.gg occasionally throws a CF challenge
-          # we can't bypass, so don't red-X the workflow on a tracker
-          # failure. Just log + carry on.
-          if curl -fsS --max-time 30 "$TRACKER_API_BASE_URL/v2/tracker/leaderboard?region=na" > /dev/null; then
-            echo "::notice::Tracker cache nudged (na leaderboard)"
-          else
-            echo "::warning::Tracker leaderboard nudge failed — non-fatal."
-          fi
+          # The leaderboard endpoint does a real tracker.gg scrape
+          # which can take 30-60s and gates on CF challenges; that's
+          # too noisy for an uptime check. The root path returns a
+          # tiny version stub instantly — perfect for liveness.
+          curl -fsS --max-time 20 "$TRACKER_API_BASE_URL/" > /dev/null
+          echo "::notice::Tracker health OK"
