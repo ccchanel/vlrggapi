@@ -1,0 +1,62 @@
+name: Hourly uptime + cache nudge
+
+# Hits the API hourly to:
+#  1. Catch a Railway deploy that quietly crashed and stayed down (no
+#     internal alerting otherwise — this turns the workflow red).
+#  2. Keep the tracker.gg cf_clearance cookie warm so a real user's
+#     first request after a quiet stretch doesn't pay the CF challenge
+#     latency.
+#
+# Pings two endpoints:
+#   - /v2/health → simple uptime ping
+#   - /v2/tracker/leaderboard?region=na → exercises the tracker-api
+#     side and refreshes the cf cookie before it ages out.
+#
+# Required repo variables:
+#   API_BASE_URL          — vlrggapi production URL (Railway)
+#   TRACKER_API_BASE_URL  — vlrscout-tracker-api production URL
+#                           (optional; tracker nudge skipped if unset)
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # top of every hour, UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: API health
+        env:
+          API_BASE_URL: ${{ vars.API_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${API_BASE_URL:-}" ]; then
+            echo "::error::API_BASE_URL repo variable not set." >&2
+            exit 1
+          fi
+          # 15s connect+read timeout — Railway cold-start adds maybe 5s,
+          # not 15s. If we time out the service is genuinely down.
+          curl -fsS --max-time 15 "$API_BASE_URL/v2/health" > /dev/null
+          echo "::notice::API health OK"
+
+      - name: Tracker cache nudge (optional)
+        env:
+          TRACKER_API_BASE_URL: ${{ vars.TRACKER_API_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TRACKER_API_BASE_URL:-}" ]; then
+            echo "::notice::TRACKER_API_BASE_URL not set — skipping tracker nudge."
+            exit 0
+          fi
+          # Best-effort — tracker.gg occasionally throws a CF challenge
+          # we can't bypass, so don't red-X the workflow on a tracker
+          # failure. Just log + carry on.
+          if curl -fsS --max-time 30 "$TRACKER_API_BASE_URL/v2/tracker/leaderboard?region=na" > /dev/null; then
+            echo "::notice::Tracker cache nudged (na leaderboard)"
+          else
+            echo "::warning::Tracker leaderboard nudge failed — non-fatal."
+          fi
