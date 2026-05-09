@@ -1023,6 +1023,37 @@ async def v2_admin_delete_user(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Admin: weekly backup of Supabase user-data tables to R2.
+#
+# Snapshots scout_data (watchlists + notes) and vods (library metadata)
+# as JSON to R2 under backups/<table>/YYYY-MM-DD.json. Keeps a rolling
+# 12-week retention. Wired to a GitHub Actions cron (Mondays 06:00 UTC)
+# that POSTs here weekly. Same X-Admin-Secret gate the rest of the
+# admin pipeline uses; no Supabase user session needed since this is
+# a server-to-server call from CI.
+# ─────────────────────────────────────────────────────────────────────
+
+
+@router.post("/admin/backup-scout-data")
+@limiter.limit("10/minute")
+async def v2_admin_backup_scout_data(
+    request: Request,
+    x_admin_secret: str = Header(default=""),
+):
+    """Snapshot scout_data + vods to R2. Server-side admin secret only —
+    GitHub Actions hits this on a weekly cron."""
+    _check_admin(x_admin_secret)
+    try:
+        from api.scrapers.backup_scout_data import run_backup
+        result = run_backup()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Backup failed: {exc}")
+    return {"status": "success", "data": result}
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Admin: mirror VLR team logos to R2.
 #
 # VLR serves logos from owcdn.net which routinely 404s when teams

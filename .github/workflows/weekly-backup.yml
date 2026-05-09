@@ -1,0 +1,43 @@
+name: Weekly scout_data backup
+
+# Hits /v2/admin/backup-scout-data on the production API every Monday
+# at 06:00 UTC. The endpoint snapshots scout_data + vods tables to R2
+# and prunes anything older than 12 weeks. Idempotent — re-running on
+# the same day overwrites that day's file rather than duplicating.
+#
+# Required repo secrets:
+#   API_BASE_URL        e.g. https://vlrggapi-production-8774.up.railway.app
+#   ADMIN_UPLOAD_SECRET same value as on Railway
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # 06:00 UTC every Monday
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST /v2/admin/backup-scout-data
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          ADMIN_UPLOAD_SECRET: ${{ secrets.ADMIN_UPLOAD_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${API_BASE_URL:-}" ] || [ -z "${ADMIN_UPLOAD_SECRET:-}" ]; then
+            echo "::error::API_BASE_URL or ADMIN_UPLOAD_SECRET secret is not set on this repo." >&2
+            exit 1
+          fi
+          # -f makes curl fail (non-zero) on HTTP 4xx/5xx so the workflow
+          # turns red on auth / config errors instead of silently
+          # succeeding.
+          curl -fsSL -X POST "$API_BASE_URL/v2/admin/backup-scout-data" \
+            -H "Content-Type: application/json" \
+            -H "X-Admin-Secret: $ADMIN_UPLOAD_SECRET" \
+            -d '{}' \
+            -o response.json
+          echo "--- response ---"
+          cat response.json
