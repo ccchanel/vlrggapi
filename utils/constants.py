@@ -47,7 +47,11 @@ CACHE_TTL_NEWS = 600
 CACHE_TTL_STATS = 14400  # 4 hours — comprehensive multi-group scrape is expensive
 CACHE_TTL_RANKINGS = 3600
 CACHE_TTL_EVENTS = 1800
-CACHE_MAX_SIZE = 1000
+CACHE_MAX_SIZE = 200  # was 1000 — cap memory; CacheManager spins up one
+# TTLCache per distinct TTL (14 groups currently), so the previous limit
+# allowed up to ~14,000 cached responses; with scraped payloads in the
+# 100-500 KB range that approached GB-scale RAM. Hot working set is
+# typically dozens of keys per group, so 200 is plenty of headroom.
 
 # Cache TTLs — new scraper endpoints
 CACHE_TTL_MATCH_DETAIL = 300

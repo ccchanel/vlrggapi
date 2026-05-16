@@ -1,0 +1,74 @@
+# Weekly Railway service restart — works around a slow in-memory
+# leak in the scraper caches. CACHE_MAX_SIZE was lowered to 200 to
+# cap the per-cycle growth, but TTLCache fragmentation + httpx
+# connection-pool accumulation still drift upward over time. A
+# clean restart every Sunday at 04:00 UTC drops RAM back to ~200 MB
+# and keeps the Railway memory-billed dimension low.
+#
+# Setup (one-time):
+#   1. Generate a Railway API token: https://railway.com/account/tokens
+#      Name it "github-actions-restart". Workspace scope is fine.
+#   2. Add it as a GitHub secret named RAILWAY_TOKEN:
+#      Settings → Secrets and variables → Actions → New repository secret
+#   3. (Optional) Trigger manually from Actions → Railway restart vlrggapi
+#      → Run workflow, to verify it works before waiting for Sunday.
+
+name: Railway restart vlrggapi
+
+on:
+  schedule:
+    # Every Sunday at 04:00 UTC (off-peak across NA/EU/APAC)
+    - cron: "0 4 * * 0"
+  workflow_dispatch: {}
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Restart vlrggapi via Railway GraphQL
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          # IDs are read from the Railway dashboard URL when viewing the
+          # service. Stable across deploys; hardcoded so the workflow
+          # doesn't need a list-services round-trip.
+          RAILWAY_SERVICE_ID: 23417083-3760-4089-b6a4-818bc76ba56d
+          RAILWAY_ENVIRONMENT_ID: c0699676-06b9-4590-a222-8f04887a89be
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RAILWAY_TOKEN:-}" ]; then
+            echo "::error::RAILWAY_TOKEN secret is not set. Add it under repo Settings → Secrets → Actions."
+            exit 1
+          fi
+
+          # serviceInstanceRedeploy redeploys the latest active
+          # deployment for this service+environment, which Railway
+          # implements as a full container restart with a fresh build
+          # cache. From the app's perspective it's identical to a manual
+          # Restart click, and triggers no rebuild.
+          MUTATION='mutation Restart($serviceId: String!, $environmentId: String!) { serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId) }'
+
+          BODY=$(jq -n \
+            --arg q "$MUTATION" \
+            --arg sid "$RAILWAY_SERVICE_ID" \
+            --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+            '{query: $q, variables: {serviceId: $sid, environmentId: $eid}}')
+
+          echo "Triggering restart for service $RAILWAY_SERVICE_ID..."
+          RESPONSE=$(curl --fail-with-body --silent --show-error \
+            -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          echo "Response: $RESPONSE"
+
+          # GraphQL returns 200 even on errors; fail explicitly when the
+          # response has an "errors" key so the workflow goes red.
+          if echo "$RESPONSE" | jq -e '.errors' > /dev/null; then
+            echo "::error::Railway API returned errors. See response above."
+            exit 1
+          fi
+
+          echo "✓ Restart triggered."
